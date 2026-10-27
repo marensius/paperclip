@@ -3,6 +3,10 @@ import { agentWakeupRequests, heartbeatRuns, issues, type Db } from "@paperclipa
 import { and, eq } from "drizzle-orm";
 import type { PgUpdateSetSource } from "drizzle-orm/pg-core";
 import { claimNativeReviewExecutionLock, readNativeReviewAssignmentContext } from "./native-review-participant.js";
+import {
+  admitGlobalRunSlot,
+  resolveGlobalMaxConcurrentRuns,
+} from "../heartbeat/global-run-admission.js";
 
 /** The run, wake, and issue lock form one reviewer admission claim. */
 export async function claimQueuedNativeReviewRun(db: Db, input: {
@@ -10,11 +14,20 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
   agentNameKey: string | null;
   claimedAt: Date;
   claimValues: PgUpdateSetSource<typeof heartbeatRuns>;
+  globalMaxConcurrentRuns?: number;
 }): Promise<typeof heartbeatRuns.$inferSelect | null> {
   const context = input.run.contextSnapshot as Record<string, unknown> | null;
   const issueId = context?.issueId;
   if (typeof issueId !== "string" || !readNativeReviewAssignmentContext(context)) return null;
   return db.transaction(async (tx) => {
+    if (
+      !(await admitGlobalRunSlot(
+        tx as unknown as Db,
+        input.globalMaxConcurrentRuns ?? resolveGlobalMaxConcurrentRuns(),
+      ))
+    ) {
+      return null;
+    }
     // Match the queue editor's lock order: issue, wake, then run.
     const [issue] = await tx.select({ id: issues.id }).from(issues).where(and(
       eq(issues.id, issueId), eq(issues.companyId, input.run.companyId),

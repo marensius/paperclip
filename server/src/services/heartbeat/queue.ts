@@ -44,6 +44,10 @@ import {
   readNativeReviewAssignmentContext,
 } from "../native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "../native-runtime/native-review-dispatch.js";
+import {
+  admitGlobalRunSlot,
+  resolveGlobalMaxConcurrentRuns,
+} from "./global-run-admission.js";
 import { adapterExecutionControls } from "../adapter-execution-control.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import {
@@ -186,7 +190,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
     "resolveSessionBeforeForWakeup" | "hasResolvablePriorSessionWorkspaceForWake">,
   Pick<HeartbeatRecoveryDependencies, "setRunStatus"> {
   sweepPendingCleanupLeases: ReturnType<typeof createHeartbeatRecovery>["sweepPendingCleanupLeases"];
-  options: Pick<HeartbeatServiceOptions, "beforeChatControlRecoveryCheck">;
+  options: Pick<HeartbeatServiceOptions, "beforeChatControlRecoveryCheck" | "globalMaxConcurrentRuns">;
   issuesSvc: Pick<ReturnType<typeof issueService>, "getDependencyReadiness" | "listDependencyReadiness">;
   treeControlSvc: Pick<ReturnType<typeof issueTreeControlService>, "getActivePauseHoldGate">;
   budgets: Pick<ReturnType<typeof budgetService>, "getInvocationBlock">;
@@ -395,6 +399,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     runTaskKey,
     filterZombieCoalesceTarget,
   } = dependencies;
+
+  const globalMaxConcurrentRuns = resolveGlobalMaxConcurrentRuns(
+    options.globalMaxConcurrentRuns,
+  );
 
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
@@ -1253,6 +1261,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       !nativeReviewContext && issueId && run.wakeupRequestId && queuedCommentIds.length > 0
         ? await db
             .transaction(async (tx) => {
+              if (
+                !(await admitGlobalRunSlot(
+                  tx as unknown as Db,
+                  globalMaxConcurrentRuns,
+                ))
+              ) {
+                return { kind: "stale" as const, run: null };
+              }
               // Match the queue-edit lock order: issue, wake, then run. Once the
               // run becomes running, a concurrent discard must observe the
               // claimed wake and return an explicit conflict; if discard wins,
@@ -1578,9 +1594,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             return claimQueuedNativeReviewRun(tx, {
               run, claimedAt, claimValues,
               agentNameKey: normalizeAgentNameKey(agent.name),
+              globalMaxConcurrentRuns,
             });
           }
           return tx.transaction(async (claimTx) => {
+            if (
+              !(await admitGlobalRunSlot(
+                claimTx as unknown as Db,
+                globalMaxConcurrentRuns,
+              ))
+            ) {
+              return null;
+            }
             const issueClaim = await lockIssueExecutionClaim(claimTx as unknown as Db);
             if (issueClaim.blocked) return null;
             if (run.wakeupRequestId) await claimTx.select({ id: agentWakeupRequests.id }).from(agentWakeupRequests).where(and(
@@ -1790,6 +1815,48 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return cancelled;
   }
 
+  async function countRunningRunsGlobal() {
+    const [row] = await db
+      .select({ count: sql<number>`count(*)::int` })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.status, "running"));
+    return Number(row?.count ?? 0);
+  }
+
+  async function listQueuedAgentIdsByPriority(cutoff: Date | null) {
+    const rows = await db
+      .select({ agentId: heartbeatRuns.agentId })
+      .from(heartbeatRuns)
+      .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
+      .where(
+        and(
+          eq(heartbeatRuns.status, "queued"),
+          eq(companies.status, "active"),
+          cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
+        ),
+      )
+      .orderBy(
+        sql`case when ${heartbeatRuns.invocationSource} = 'on_demand' and ${heartbeatRuns.triggerDetail} = 'manual' then 0 else 1 end`,
+        asc(heartbeatRuns.createdAt),
+      );
+    return [...new Set(rows.map((row) => row.agentId))];
+  }
+
+  async function resumeNextGlobalRun() {
+    if (globalMaxConcurrentRuns <= 0) return false;
+    if ((await countRunningRunsGlobal()) >= globalMaxConcurrentRuns) return false;
+    const cutoff = await getWorktreeExecutionCutoff();
+    for (const agentId of await listQueuedAgentIdsByPriority(cutoff)) {
+      const claimed = await startNextQueuedRunForAgent(agentId);
+      if (claimed.length > 0) return true;
+    }
+    return false;
+  }
+
+  function hasGlobalRunLimit() {
+    return globalMaxConcurrentRuns > 0;
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
@@ -1886,20 +1953,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       });
     }
 
-    const queuedRuns = await db
-      .select({ agentId: heartbeatRuns.agentId })
-      .from(heartbeatRuns)
-      .innerJoin(companies, eq(companies.id, heartbeatRuns.companyId))
-      .where(
-        and(
-          eq(heartbeatRuns.status, "queued"),
-          eq(companies.status, "active"),
-          cutoff ? gte(heartbeatRuns.createdAt, cutoff) : undefined,
-        ),
-      );
-
-    const agentIds = [...new Set(queuedRuns.map((r) => r.agentId))];
-    for (const agentId of agentIds) {
+    for (const agentId of await listQueuedAgentIdsByPriority(cutoff)) {
       await startNextQueuedRunForAgent(agentId);
     }
   }
@@ -2050,6 +2104,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             : 3
           : 2;
         if (leftRank !== rightRank) return leftRank - rightRank;
+        const leftInteractive =
+          left.invocationSource === "on_demand" &&
+          left.triggerDetail === "manual";
+        const rightInteractive =
+          right.invocationSource === "on_demand" &&
+          right.triggerDetail === "manual";
+        if (leftInteractive !== rightInteractive) return leftInteractive ? -1 : 1;
         const leftPriorityRank = issueRunPriorityRank(leftIssue?.priority);
         const rightPriorityRank = issueRunPriorityRank(rightIssue?.priority);
         if (leftPriorityRank !== rightPriorityRank)
@@ -4887,6 +4948,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     withChatControlRecoveryGate,
     trackWakeup,
     resumeQueuedRuns,
+    resumeNextGlobalRun,
+    hasGlobalRunLimit,
     parseHeartbeatPolicy,
     claimDueTimerHeartbeat,
   };
