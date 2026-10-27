@@ -742,6 +742,7 @@ export interface HeartbeatServiceOptions {
   pluginWorkerManager?: PluginWorkerManager;
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   runtimeEnv?: Record<string, string | undefined>;
+  globalMaxConcurrentRuns?: number;
   /**
    * Provider-boundary seam for persisted native-run recovery tests. Keeping
    * the seam here exercises the production reaper, claim, execution, package
@@ -1284,6 +1285,8 @@ export function heartbeatService(
     withChatControlRecoveryGate,
     trackWakeup,
     resumeQueuedRuns,
+    resumeNextGlobalRun,
+    hasGlobalRunLimit,
     parseHeartbeatPolicy,
     claimDueTimerHeartbeat,
   } = heartbeatQueue;
@@ -3922,7 +3925,11 @@ export function heartbeatService(
               logger.warn({ err, runId: run.id }, "failed to deliver settled tool reviews after execution cleanup");
             });
         }
-        await startNextQueuedRunForAgent(run.agentId);
+        if (hasGlobalRunLimit()) {
+          await resumeNextGlobalRun();
+        } else {
+          await startNextQueuedRunForAgent(run.agentId);
+        }
       }
     }
   }
@@ -4073,6 +4080,8 @@ export function heartbeatService(
     retryScheduledRetryNow,
 
     resumeQueuedRuns,
+    resumeNextGlobalRun,
+    hasGlobalRunLimit,
 
     resumeQueuedRunsForAgent: async (companyId: string, agentId: string) => {
       const agent = await getAgent(agentId);
