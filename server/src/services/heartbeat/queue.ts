@@ -46,7 +46,12 @@ import {
 import { claimQueuedNativeReviewRun } from "../native-runtime/native-review-dispatch.js";
 import {
   admitGlobalRunSlot,
+  listGlobalQueuedRunCandidates,
+  readGlobalQueueBacklogStats,
+  resolveGlobalBackgroundStarvationMs,
   resolveGlobalMaxConcurrentRuns,
+  resolveGlobalMaxConcurrentRunsPerCompany,
+  resolveGlobalQueueScanLimit,
 } from "./global-run-admission.js";
 import { adapterExecutionControls } from "../adapter-execution-control.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
@@ -190,7 +195,10 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
     "resolveSessionBeforeForWakeup" | "hasResolvablePriorSessionWorkspaceForWake">,
   Pick<HeartbeatRecoveryDependencies, "setRunStatus"> {
   sweepPendingCleanupLeases: ReturnType<typeof createHeartbeatRecovery>["sweepPendingCleanupLeases"];
-  options: Pick<HeartbeatServiceOptions, "beforeChatControlRecoveryCheck" | "globalMaxConcurrentRuns">;
+  options: Pick<
+    HeartbeatServiceOptions,
+    "beforeChatControlRecoveryCheck" | "globalMaxConcurrentRuns" | "globalMaxConcurrentRunsPerCompany"
+  >;
   issuesSvc: Pick<ReturnType<typeof issueService>, "getDependencyReadiness" | "listDependencyReadiness">;
   treeControlSvc: Pick<ReturnType<typeof issueTreeControlService>, "getActivePauseHoldGate">;
   budgets: Pick<ReturnType<typeof budgetService>, "getInvocationBlock">;
@@ -403,6 +411,13 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   const globalMaxConcurrentRuns = resolveGlobalMaxConcurrentRuns(
     options.globalMaxConcurrentRuns,
   );
+  const globalMaxConcurrentRunsPerCompany =
+    resolveGlobalMaxConcurrentRunsPerCompany(
+      options.globalMaxConcurrentRunsPerCompany,
+    );
+  const globalQueueScanLimit = resolveGlobalQueueScanLimit();
+  const globalBackgroundStarvationMs = resolveGlobalBackgroundStarvationMs();
+  let lastGlobalClaimCompanyId: string | null = null;
 
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
     const runtimeConfig = parseObject(agent.runtimeConfig);
@@ -1265,6 +1280,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 !(await admitGlobalRunSlot(
                   tx as unknown as Db,
                   globalMaxConcurrentRuns,
+                  {
+                    companyId: run.companyId,
+                    companyLimit: globalMaxConcurrentRunsPerCompany,
+                  },
                 ))
               ) {
                 return { kind: "stale" as const, run: null };
@@ -1595,6 +1614,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               run, claimedAt, claimValues,
               agentNameKey: normalizeAgentNameKey(agent.name),
               globalMaxConcurrentRuns,
+              globalMaxConcurrentRunsPerCompany,
             });
           }
           return tx.transaction(async (claimTx) => {
@@ -1602,6 +1622,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               !(await admitGlobalRunSlot(
                 claimTx as unknown as Db,
                 globalMaxConcurrentRuns,
+                {
+                  companyId: run.companyId,
+                  companyLimit: globalMaxConcurrentRunsPerCompany,
+                },
               ))
             ) {
               return null;
@@ -1842,19 +1866,89 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return [...new Set(rows.map((row) => row.agentId))];
   }
 
+  function rotateCompanyOrder(companyIds: string[]) {
+    const unique = [...new Set(companyIds)].sort();
+    if (unique.length <= 1 || !lastGlobalClaimCompanyId) return unique;
+    const cursorIndex = unique.indexOf(lastGlobalClaimCompanyId);
+    if (cursorIndex < 0) return unique;
+    return [
+      ...unique.slice(cursorIndex + 1),
+      ...unique.slice(0, cursorIndex + 1),
+    ];
+  }
+
   async function resumeNextGlobalRun() {
-    if (globalMaxConcurrentRuns <= 0) return false;
-    if ((await countRunningRunsGlobal()) >= globalMaxConcurrentRuns) return false;
+    if (
+      globalMaxConcurrentRuns <= 0 &&
+      globalMaxConcurrentRunsPerCompany <= 0
+    ) {
+      return false;
+    }
+    if (
+      globalMaxConcurrentRuns > 0 &&
+      (await countRunningRunsGlobal()) >= globalMaxConcurrentRuns
+    ) {
+      return false;
+    }
     const cutoff = await getWorktreeExecutionCutoff();
-    for (const agentId of await listQueuedAgentIdsByPriority(cutoff)) {
-      const claimed = await startNextQueuedRunForAgent(agentId);
-      if (claimed.length > 0) return true;
+    const candidates = await listGlobalQueuedRunCandidates(db, {
+      cutoff,
+      limit: globalQueueScanLimit,
+    });
+    if (candidates.length === 0) return false;
+
+    const backlog = await readGlobalQueueBacklogStats(db, cutoff);
+    if (backlog.queuedCount > 0) {
+      logger.info(
+        {
+          queuedCount: backlog.queuedCount,
+          oldestQueuedAt: backlog.oldestQueuedAt,
+          oldestQueuedAgeMs: backlog.oldestQueuedAgeMs,
+          globalLimit: globalMaxConcurrentRuns,
+          globalPerCompanyLimit: globalMaxConcurrentRunsPerCompany,
+        },
+        "global run queue backlog",
+      );
+    }
+
+    const now = Date.now();
+    const companyOrder = rotateCompanyOrder(
+      candidates.map((candidate) => candidate.companyId),
+    );
+    const companyRank = new Map(
+      companyOrder.map((companyId, index) => [companyId, index]),
+    );
+    const attemptRank = (candidate: (typeof candidates)[number]) => {
+      const ageMs = now - candidate.createdAt.getTime();
+      if (!candidate.isManual && ageMs >= globalBackgroundStarvationMs) return 0;
+      if (candidate.isManual) return 1;
+      return 2;
+    };
+    const orderedCandidates = [...candidates].sort(
+      (left, right) =>
+        attemptRank(left) - attemptRank(right) ||
+        (companyRank.get(left.companyId) ?? Number.MAX_SAFE_INTEGER) -
+          (companyRank.get(right.companyId) ?? Number.MAX_SAFE_INTEGER) ||
+        left.createdAt.getTime() - right.createdAt.getTime() ||
+        left.agentId.localeCompare(right.agentId),
+    );
+
+    for (const candidate of orderedCandidates) {
+      const claimed = await startNextQueuedRunForAgent(candidate.agentId, {
+        maxClaims: 1,
+      });
+      if (claimed.length > 0) {
+        lastGlobalClaimCompanyId = claimed[0].companyId;
+        return true;
+      }
     }
     return false;
   }
 
   function hasGlobalRunLimit() {
-    return globalMaxConcurrentRuns > 0;
+    return (
+      globalMaxConcurrentRuns > 0 || globalMaxConcurrentRunsPerCompany > 0
+    );
   }
 
   async function resumeQueuedRuns() {
@@ -1997,7 +2091,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
   }
 
-  async function startNextQueuedRunForAgent(agentId: string) {
+  async function startNextQueuedRunForAgent(
+    agentId: string,
+    claimOptions: { maxClaims?: number } = {},
+  ) {
     if ((await getSchedulingSuppression()).suppressed) return [];
     const cutoff = await getWorktreeExecutionCutoff();
     // Cancelled after the start lock is released: cancelRunInternal promotes the
@@ -2118,9 +2215,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return left.createdAt.getTime() - right.createdAt.getTime();
       });
 
+      const claimBudget = Math.min(
+        availableSlots,
+        claimOptions.maxClaims ?? availableSlots,
+      );
+      if (claimBudget <= 0) return [];
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
       for (const queuedRun of prioritizedRuns) {
-        if (claimedRuns.length >= availableSlots) break;
+        if (claimedRuns.length >= claimBudget) break;
         let claimed: typeof heartbeatRuns.$inferSelect | null;
         try {
           claimed = await claimQueuedRun(queuedRun, companyAgents, deferredPostCommitEffects);

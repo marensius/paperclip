@@ -149,6 +149,9 @@ export const heartbeatRuns = pgTable(
       table.agentId,
       table.startedAt,
     ),
+    queuedCompanyAgentCreatedIdx: index("heartbeat_runs_queued_company_agent_created_idx")
+      .on(table.companyId, table.agentId, table.createdAt)
+      .where(sql`${table.status} = 'queued'`),
     companyIssueCreatedIdx: index("heartbeat_runs_company_issue_created_idx").on(
       table.companyId,
       table.issueId,

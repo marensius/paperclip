@@ -1,0 +1,1 @@
+CREATE INDEX "heartbeat_runs_queued_company_agent_created_idx" ON "heartbeat_runs" USING btree ("company_id","agent_id","created_at") WHERE "heartbeat_runs"."status" = 'queued';
