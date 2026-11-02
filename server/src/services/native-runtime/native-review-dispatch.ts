@@ -6,6 +6,7 @@ import { claimNativeReviewExecutionLock, readNativeReviewAssignmentContext } fro
 import {
   admitGlobalRunSlot,
   resolveGlobalMaxConcurrentRuns,
+  resolveGlobalMaxConcurrentRunsPerCompany,
 } from "../heartbeat/global-run-admission.js";
 
 /** The run, wake, and issue lock form one reviewer admission claim. */
@@ -15,6 +16,7 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
   claimedAt: Date;
   claimValues: PgUpdateSetSource<typeof heartbeatRuns>;
   globalMaxConcurrentRuns?: number;
+  globalMaxConcurrentRunsPerCompany?: number;
 }): Promise<typeof heartbeatRuns.$inferSelect | null> {
   const context = input.run.contextSnapshot as Record<string, unknown> | null;
   const issueId = context?.issueId;
@@ -24,6 +26,12 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
       !(await admitGlobalRunSlot(
         tx as unknown as Db,
         input.globalMaxConcurrentRuns ?? resolveGlobalMaxConcurrentRuns(),
+        {
+          companyId: input.run.companyId,
+          companyLimit:
+            input.globalMaxConcurrentRunsPerCompany ??
+            resolveGlobalMaxConcurrentRunsPerCompany(),
+        },
       ))
     ) {
       return null;
