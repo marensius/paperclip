@@ -76,6 +76,7 @@ import {
   issueApprovals,
   issueAccessGrants,
   issueAttachments,
+  issueAttachmentCleanupOutbox,
   issueCreateIdempotencyKeys,
   issueInboxArchives,
   issueLabels,
@@ -210,6 +211,7 @@ import {
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { retentionEligibilityCondition } from "./issue-retention.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
@@ -11683,11 +11685,55 @@ export function issueService(db: Db) {
       return cleared;
     },
 
-    remove: (id: string) =>
+    remove: (
+      id: string,
+      options: {
+        requireRetentionEligible?: {
+          companyId: string;
+          cutoff: Date;
+          audit: {
+            actorType: "agent" | "user";
+            actorId: string;
+            agentId: string | null;
+            runId: string | null;
+            agentApiKeyId: string | null;
+            retentionDays: number;
+            identifier: string | null;
+            status: string;
+            terminalAt: string;
+            archivedAt: string;
+            cutoff: string;
+          };
+        };
+      } = {},
+    ) =>
       db.transaction(async (tx) => {
-        const attachmentAssetIds = await tx
-          .select({ assetId: issueAttachments.assetId })
+        if (options.requireRetentionEligible) {
+          const { companyId, cutoff } = options.requireRetentionEligible;
+          // Re-evaluate the complete eligibility predicate under a row lock.
+          // Locking only on id and then checking a few columns would let a
+          // reopened/re-completed issue pass with a fresh terminal timestamp.
+          const [guard] = await tx
+            .select({ id: issues.id })
+            .from(issues)
+            .where(and(eq(issues.id, id), retentionEligibilityCondition(companyId, cutoff)))
+            .for("update");
+          if (!guard) {
+            const [existing] = await tx
+              .select({ id: issues.id })
+              .from(issues)
+              .where(eq(issues.id, id));
+            if (!existing) return null;
+            throw conflict("Issue is no longer retention-eligible.");
+          }
+        }
+        const attachmentObjects = await tx
+          .select({
+            assetId: issueAttachments.assetId,
+            objectKey: assets.objectKey,
+          })
           .from(issueAttachments)
+          .innerJoin(assets, eq(issueAttachments.assetId, assets.id))
           .where(eq(issueAttachments.issueId, id));
         const issueDocumentIds = await tx
           .select({ documentId: issueDocuments.documentId })
@@ -11716,11 +11762,11 @@ export function issueService(db: Db) {
           throw err;
         }
 
-        if (removedIssue && attachmentAssetIds.length > 0) {
+        if (removedIssue && attachmentObjects.length > 0) {
           await tx.delete(assets).where(
             inArray(
               assets.id,
-              attachmentAssetIds.map((row) => row.assetId),
+              attachmentObjects.map((row) => row.assetId),
             ),
           );
         }
@@ -11735,6 +11781,50 @@ export function issueService(db: Db) {
         }
 
         if (!removedIssue) return null;
+
+        if (options.requireRetentionEligible && attachmentObjects.length > 0) {
+          // Commit the cleanup intent in the same transaction as the issue
+          // delete. Object-store deletion happens only after this commit, so a
+          // rollback can never leave a live issue referencing a removed
+          // object. Depending on the object key keeps the outbox idempotent.
+          await tx
+            .insert(issueAttachmentCleanupOutbox)
+            .values(
+              attachmentObjects.map((row) => ({
+                companyId: options.requireRetentionEligible!.companyId,
+                issueId: id,
+                assetId: row.assetId,
+                objectKey: row.objectKey,
+              })),
+            )
+            .onConflictDoNothing();
+        }
+
+        if (options.requireRetentionEligible) {
+          const retention = options.requireRetentionEligible;
+          const audit = retention.audit;
+          await logActivity(tx as unknown as Db, {
+            companyId: retention.companyId,
+            actorType: audit.actorType,
+            actorId: audit.actorId,
+            agentId: audit.agentId,
+            runId: audit.runId,
+            agentApiKeyId: audit.agentApiKeyId,
+            action: "issue.retention_deleted",
+            entityType: "issue",
+            entityId: id,
+            details: {
+              identifier: audit.identifier,
+              status: audit.status,
+              terminalAt: audit.terminalAt,
+              archivedAt: audit.archivedAt,
+              retentionDays: audit.retentionDays,
+              cutoff: audit.cutoff,
+              policy: "issue-retention.v1",
+            },
+          });
+        }
+
         const [enriched] = await withIssueLabels(tx, [removedIssue]);
         return enriched;
       }),

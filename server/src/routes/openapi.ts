@@ -4279,6 +4279,34 @@ registry.registerPath({
 });
 
 registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/issues/retention-purge",
+  tags: ["issues"],
+  summary: "Purge retention-eligible archived issues",
+  description:
+    "Server-owned hard delete for the retention routine. Requires `issues:retention_delete`. The caller never supplies issue IDs: the server selects `done`/`cancelled` issues older than the retention window that carry an agent-attributed retention archive written by an identity that currently holds `issues:retention_delete` (a per-user inbox archive from another user never qualifies), and skips issues with children, cases, decisions, pending approvals or interactions, active recovery, an active checkout, or a scheduled monitor. Batches are capped at 100 and every delete is audited. Use `dryRun` to preview the eligible candidates. Attachment object cleanup is committed to a durable outbox in the same transaction and drained after the batch; failed rows stay pending and are retried on a later purge pass.",
+  request: {
+    params: z.object({ companyId: z.string() }),
+    body: jsonBody(
+      z
+        .object({
+          retentionDays: z.number().int().min(7).max(365).optional(),
+          limit: z.number().int().min(1).max(100).optional(),
+          dryRun: z.boolean().optional(),
+        })
+        .strict()
+        .default({}),
+    ),
+  },
+  responses: {
+    200: r.ok(),
+    400: r.badRequest,
+    401: r.unauthorized,
+    403: r.forbidden,
+  },
+});
+
+registry.registerPath({
   method: "get",
   path: "/api/issues/{id}",
   tags: ["issues"],

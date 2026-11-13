@@ -1315,6 +1315,7 @@ function createAuthorizationService(db: Db | DbTransaction, readSnapshot?: ReadA
       input.action === "agent_config:update" ||
       input.action === "skill_config:update" ||
       input.action === "inbox:manage" ||
+      input.action === "issues:retention_delete" ||
       input.action === "runtime:manage" ||
       input.action === "secrets:read" ||
       input.action === "secrets:propose"

@@ -181,6 +181,10 @@ export const runnerApiReference: Record<string, { section: string; description?:
     "section": "Issues (Tasks)",
     "description": "Reverse inbox archive; same target and policy rules"
   },
+  "POST /api/companies/{}/issues/retention-purge": {
+    "section": "Issues (Tasks)",
+    "description": "Server-owned retention purge; requires `issues:retention_delete`. The server selects eligible done/cancelled issues that carry an agent-attributed retention archive from an identity holding `issues:retention_delete` (never caller-named IDs and never a per-user inbox archive), caps the batch at 100, supports `dryRun`, and skips issues with children, cases, decisions, pending approvals/interactions, active recovery, or an active checkout/monitor."
+  },
   "GET /api/issues/{}/interactions": {
     "section": "Issues (Tasks)",
     "description": "List issue-thread interactions"
