@@ -190,6 +190,11 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // actor-level inbox:manage authority and target-user policy.
   { method: "POST", path: /^\/api\/issues\/[^/]+\/inbox-archive$/ },
   { method: "DELETE", path: /^\/api\/issues\/[^/]+\/inbox-archive$/ },
+  // Purpose-scoped retention purge. The caller cannot name an issue: the
+  // server decides eligibility (archived, terminal, old enough, no open
+  // children/cases/decisions) and requires the dedicated
+  // `issues:retention_delete` grant. The generic issue hard delete stays out.
+  { method: "POST", path: /^\/api\/companies\/[^/]+\/issues\/retention-purge$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/approvals$/ },
 
   // Files: the queue encodes binary bodies; HTTP/2 carries the same bytes directly.

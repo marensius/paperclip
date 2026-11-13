@@ -1599,6 +1599,7 @@ describe("sandbox callback bridge", () => {
       { method: "PATCH", path: "/api/issues/issue-1" },
       { method: "POST", path: "/api/issues/issue-1/inbox-archive" },
       { method: "DELETE", path: "/api/issues/issue-1/inbox-archive" },
+      { method: "POST", path: "/api/companies/co-1/issues/retention-purge" },
       { method: "GET", path: "/api/issues/issue-1/approvals" },
       { method: "GET", path: "/api/issues/issue-1/work-products" },
       { method: "POST", path: "/api/issues/issue-1/work-products" },
@@ -1675,6 +1676,12 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/issues/issue-1/inbox-archive/extra" },
       { method: "DELETE", path: "/api/issues/issue-1/comments" },
       { method: "DELETE", path: "/api/issues/issue-1" },
+      // Retention purge is exactly one company-scoped POST. It must not admit
+      // a per-issue path, a different method, or any sub-resource.
+      { method: "DELETE", path: "/api/companies/co-1/issues/retention-purge" },
+      { method: "POST", path: "/api/companies/co-1/issues/retention-purge/extra" },
+      { method: "POST", path: "/api/issues/issue-1/retention-purge" },
+      { method: "DELETE", path: "/api/issues/issue-1/retention-purge" },
       { method: "POST", path: "/api/approvals/ap-1/approve" },
       { method: "POST", path: "/api/approvals/ap-1/reject" },
       { method: "POST", path: "/api/companies/co-1/logo" },

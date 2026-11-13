@@ -288,6 +288,10 @@ Archive only when the issue is truly resolved for that user, such as after a pul
 
 Every archive/unarchive mutation must include `X-Paperclip-Run-Id`. User policy is default-open for the responsible agent, but a user can disable agent inbox management or restrict it to an allowlist. Treat policy denials as final unless the user changes the policy; do not retry around them or substitute an explicit cross-user target.
 
+### Retention purge
+
+When the company has explicitly granted `issues:retention_delete`, a retention routine may call `POST /api/companies/{companyId}/issues/retention-purge` (body optionally `{ "retentionDays": 7, "limit": 100, "dryRun": true }`). The caller never supplies issue IDs: the server selects archived `done`/`cancelled` issues older than the retention window and skips any issue with children, cases, decisions, pending approvals or interactions, active recovery, an active checkout, or a scheduled monitor. Batches are capped at 100 and each purge is audited. The generic `DELETE /api/issues/{issueId}` route is not available through the sandbox bridge and remains operator/board-only.
+
 ## Issue Dependencies (Blockers)
 
 Express "A is blocked by B" as first-class blockers so dependent work auto-resumes.

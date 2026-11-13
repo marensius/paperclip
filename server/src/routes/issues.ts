@@ -1,3 +1,4 @@
+import { ISSUE_RETENTION_MIN_DAYS, issueRetentionBatchLimit, issueRetentionCutoff, issueRetentionService } from "../services/issue-retention.js";
 import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
@@ -424,6 +425,14 @@ const inboxArchiveBodySchema = z
   .object({
     userId: z.string().trim().min(1).optional(),
 }).strict().default({});
+const issueRetentionPurgeSchema = z
+  .object({
+    retentionDays: z.number().int().min(7).max(365).optional(),
+    limit: z.number().int().min(1).max(100).optional(),
+    dryRun: z.boolean().optional(),
+  })
+  .strict()
+  .default({});
 const externalObjectSummariesSchema = z.object({
   issueIds: z.array(z.string().uuid()).max(1000),
 }).strict();
@@ -15918,6 +15927,165 @@ export function issueRoutes(
         return;
       }
       res.json({ ...issueResponse, changes, comment });
+    },
+  );
+
+  router.post(
+    "/companies/:companyId/issues/retention-purge",
+    validate(issueRetentionPurgeSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      assertCompanyAccess(req, companyId);
+      if (await assertLowTrustControlPlaneDenied(req, res, companyId)) return;
+
+      // Hard delete must never ride on the broad `issue:mutate` boundary or on
+      // `tasks:manage_active_checkouts`. It requires its own narrowly scoped,
+      // non-default permission grant.
+      const decision = await access.decide({
+        actor: req.actor,
+        action: "issues:retention_delete",
+        resource: { type: "company", companyId },
+      });
+      if (!decision.allowed) {
+        res.status(403).json({
+          error: "Missing permission: issues:retention_delete",
+          details: {
+            companyId,
+            reason: decision.reason,
+            explanation: decision.explanation,
+            securityPrinciples: [
+              "Least Privilege",
+              "Complete Mediation",
+              "Fail Securely",
+            ],
+          },
+        });
+        return;
+      }
+
+      const actorRunId = requireAgentRunId(req, res);
+      if (req.actor.type === "agent" && !actorRunId) return;
+
+      const now = new Date();
+      const retentionDays = req.body.retentionDays ?? ISSUE_RETENTION_MIN_DAYS;
+      const cutoff = issueRetentionCutoff(now, retentionDays);
+      const limit = issueRetentionBatchLimit(req.body.limit);
+      const { candidates, hasMore } = await issueRetentionService(db).listEligible({
+        companyId,
+        cutoff,
+        limit,
+      });
+
+      const actor = getActorInfo(req);
+      if (req.body.dryRun === true) {
+        res.json({
+          policy: "issue-retention.v1",
+          cutoff: cutoff.toISOString(),
+          retentionDays,
+          limit,
+          dryRun: true,
+          eligible: candidates.map((candidate) => ({
+            id: candidate.id,
+            identifier: candidate.identifier,
+            status: candidate.status,
+            terminalAt: new Date(candidate.terminalAt).toISOString(),
+            archivedAt: new Date(candidate.archivedAt).toISOString(),
+          })),
+          deleted: [],
+          skipped: [],
+          hasMore,
+        });
+        return;
+      }
+      const deleted: Array<{
+        id: string;
+        identifier: string | null;
+        status: string;
+        terminalAt: string;
+        archivedAt: string;
+      }> = [];
+      const skipped: Array<{
+        id: string;
+        identifier: string | null;
+        reason: string;
+      }> = [];
+
+      for (const candidate of candidates) {
+        try {
+          // Reuse the exact attachment cleanup the explicit board delete route
+          // performs, but only for issues this server-side query already
+          // classified as retention-eligible.
+          const attachments = await svc.listAttachments(candidate.id);
+          const removed = await svc.remove(candidate.id, { requireRetentionEligible: true });
+          if (!removed) {
+            skipped.push({
+              id: candidate.id,
+              identifier: candidate.identifier,
+              reason: "already_deleted",
+            });
+            continue;
+          }
+          for (const attachment of attachments) {
+            try {
+              await storage.deleteObject(attachment.companyId, attachment.objectKey);
+            } catch (err) {
+              logger.warn(
+                { err, issueId: candidate.id, attachmentId: attachment.id },
+                "failed to delete attachment object during issue retention purge",
+              );
+            }
+          }
+          deleted.push({
+            id: candidate.id,
+            identifier: candidate.identifier,
+            status: candidate.status,
+            terminalAt: new Date(candidate.terminalAt).toISOString(),
+            archivedAt: new Date(candidate.archivedAt).toISOString(),
+          });
+          await logActivity(db, {
+            companyId,
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+            action: "issue.retention_deleted",
+            entityType: "issue",
+            entityId: candidate.id,
+            details: {
+              identifier: candidate.identifier,
+              status: candidate.status,
+              terminalAt: new Date(candidate.terminalAt).toISOString(),
+              archivedAt: new Date(candidate.archivedAt).toISOString(),
+              retentionDays,
+              cutoff: cutoff.toISOString(),
+              policy: "issue-retention.v1",
+            },
+          });
+        } catch (error) {
+          // A foreign key or concurrent state change can still block a row that
+          // the eligibility query selected. Skip it and keep the batch moving.
+          if (error instanceof HttpError && error.status === 409) {
+            skipped.push({
+              id: candidate.id,
+              identifier: candidate.identifier,
+              reason: error.message,
+            });
+            continue;
+          }
+          throw error;
+        }
+      }
+
+      res.json({
+        policy: "issue-retention.v1",
+        cutoff: cutoff.toISOString(),
+        retentionDays,
+        limit,
+        deleted,
+        skipped,
+        hasMore,
+      });
     },
   );
 

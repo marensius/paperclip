@@ -11683,8 +11683,33 @@ export function issueService(db: Db) {
       return cleared;
     },
 
-    remove: (id: string) =>
+    remove: (id: string, options: { requireRetentionEligible?: boolean } = {}) =>
       db.transaction(async (tx) => {
+        if (options.requireRetentionEligible) {
+          // Serialize against a concurrent reopen or checkout and re-check the
+          // terminal state inside the delete transaction. The route's
+          // eligibility query is the primary gate; this closes the race between
+          // selection and deletion.
+          const [guard] = await tx
+            .select({
+              status: issues.status,
+              checkoutRunId: issues.checkoutRunId,
+              executionRunId: issues.executionRunId,
+              monitorNextCheckAt: issues.monitorNextCheckAt,
+            })
+            .from(issues)
+            .where(eq(issues.id, id))
+            .for("update");
+          if (!guard) return null;
+          if (
+            (guard.status !== "done" && guard.status !== "cancelled") ||
+            guard.checkoutRunId ||
+            guard.executionRunId ||
+            guard.monitorNextCheckAt
+          ) {
+            throw conflict("Issue is no longer retention-eligible.");
+          }
+        }
         const attachmentAssetIds = await tx
           .select({ assetId: issueAttachments.assetId })
           .from(issueAttachments)

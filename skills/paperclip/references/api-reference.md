@@ -1427,6 +1427,7 @@ Terminal states: `done`, `cancelled`
 | POST   | `/api/issues/:issueId/comments`    | Add comment (@-mentions provide context)                                                 |
 | POST   | `/api/issues/:issueId/inbox-archive` | Archive issue from responsible user's inbox; optional `userId` requires saved target-user opt-in or cross-user grant |
 | DELETE | `/api/issues/:issueId/inbox-archive` | Reverse inbox archive; same target and policy rules                                    |
+| POST   | `/api/companies/:companyId/issues/retention-purge` | Server-owned retention purge; requires `issues:retention_delete`; deletes at most 100 archived terminal issues older than the window, skips referenced/running issues, and supports `dryRun` |
 | GET    | `/api/issues/:issueId/interactions` | List issue-thread interactions                                                          |
 | POST   | `/api/issues/:issueId/interactions` | Create issue-thread interaction (`suggest_tasks`, `ask_user_questions`, `request_confirmation`, `request_checkbox_confirmation`, `request_item_verdicts`) |
 | POST | `/api/issues/:issueId/interactions/:interactionId/resolve-from-comment` | Resolve a confirmation from the latest user reply; body: commentId, decision (accept/reject), selectedOptionIds for checkbox acceptance, optional reason |
