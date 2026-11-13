@@ -48,6 +48,12 @@ import {
   admitGlobalRunSlot,
   resolveGlobalMaxConcurrentRuns,
 } from "./global-run-admission.js";
+import {
+  admitHostRunSlot,
+  resolveMaxConcurrentRunsPerHost,
+  resolveRunAdmissionHostKey,
+  withRunAdmissionHostKey,
+} from "./host-run-admission.js";
 import { adapterExecutionControls } from "../adapter-execution-control.js";
 import { executionFailureRetryCount } from "../execution-recovery-attempt.js";
 import {
@@ -190,7 +196,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
     "resolveSessionBeforeForWakeup" | "hasResolvablePriorSessionWorkspaceForWake">,
   Pick<HeartbeatRecoveryDependencies, "setRunStatus"> {
   sweepPendingCleanupLeases: ReturnType<typeof createHeartbeatRecovery>["sweepPendingCleanupLeases"];
-  options: Pick<HeartbeatServiceOptions, "beforeChatControlRecoveryCheck" | "globalMaxConcurrentRuns">;
+  options: Pick<HeartbeatServiceOptions, "beforeChatControlRecoveryCheck" | "globalMaxConcurrentRuns" | "maxConcurrentRunsPerHost">;
   issuesSvc: Pick<ReturnType<typeof issueService>, "getDependencyReadiness" | "listDependencyReadiness">;
   treeControlSvc: Pick<ReturnType<typeof issueTreeControlService>, "getActivePauseHoldGate">;
   budgets: Pick<ReturnType<typeof budgetService>, "getInvocationBlock">;
@@ -402,6 +408,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
 
   const globalMaxConcurrentRuns = resolveGlobalMaxConcurrentRuns(
     options.globalMaxConcurrentRuns,
+  );
+  const maxConcurrentRunsPerHost = resolveMaxConcurrentRunsPerHost(
+    options.maxConcurrentRunsPerHost,
   );
 
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
@@ -1167,12 +1176,23 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     }
 
     const claimedAt = new Date();
+    const issueExecutionContext = issueId
+      ? await getIssueExecutionContext(run.companyId, issueId)
+      : null;
+    const admissionEnvironmentId =
+      parseIssueExecutionWorkspaceSettings(
+        issueExecutionContext?.executionWorkspaceSettings,
+        { includeEnvironmentId: true },
+      )?.environmentId ??
+      agent.defaultEnvironmentId ??
+      null;
+    const admissionHostKey = await resolveRunAdmissionHostKey(db, {
+      environmentId: admissionEnvironmentId,
+    });
     const responsibleUserId = await resolveResponsibleUserIdForRun({
       run,
       contextSnapshot: context,
-      issueContext: issueId
-        ? await getIssueExecutionContext(run.companyId, issueId)
-        : null,
+      issueContext: issueExecutionContext,
       routineEnvContext: {
         routineId: null,
         env: null,
@@ -1265,6 +1285,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                 !(await admitGlobalRunSlot(
                   tx as unknown as Db,
                   globalMaxConcurrentRuns,
+                )) ||
+                !(await admitHostRunSlot(
+                  tx as unknown as Db,
+                  maxConcurrentRunsPerHost,
+                  admissionHostKey,
                 ))
               ) {
                 return { kind: "stale" as const, run: null };
@@ -1417,6 +1442,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     ...legacyControllerClaim(run.runtimeMode),
                     responsibleUserId,
                     startedAt: lockedRun.startedAt ?? claimedAt,
+                    ...(admissionHostKey
+                      ? {
+                          contextSnapshot: withRunAdmissionHostKey(
+                            lockedRun.contextSnapshot,
+                            admissionHostKey,
+                          ),
+                        }
+                      : {}),
                     updatedAt: claimedAt,
                   })
                   .where(
@@ -1517,10 +1550,18 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                     ...legacyControllerClaim(run.runtimeMode),
                   responsibleUserId,
                   startedAt: lockedRun.startedAt ?? claimedAt,
-                  contextSnapshot: withQueuedCommentIdsInRunContext(
-                    lockedRun.contextSnapshot,
-                    liveIds,
-                  ),
+                  contextSnapshot: admissionHostKey
+                    ? withRunAdmissionHostKey(
+                        withQueuedCommentIdsInRunContext(
+                          lockedRun.contextSnapshot,
+                          liveIds,
+                        ),
+                        admissionHostKey,
+                      )
+                    : withQueuedCommentIdsInRunContext(
+                        lockedRun.contextSnapshot,
+                        liveIds,
+                      ),
                   updatedAt: claimedAt,
                 })
                 .where(
@@ -1584,6 +1625,14 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             ...legacyControllerClaim(run.runtimeMode),
             responsibleUserId,
             startedAt: run.startedAt ?? claimedAt,
+            ...(admissionHostKey
+              ? {
+                  contextSnapshot: withRunAdmissionHostKey(
+                    run.contextSnapshot,
+                    admissionHostKey,
+                  ),
+                }
+              : {}),
             updatedAt: claimedAt,
           };
           if (nativeReviewContext) {
@@ -1595,6 +1644,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               run, claimedAt, claimValues,
               agentNameKey: normalizeAgentNameKey(agent.name),
               globalMaxConcurrentRuns,
+              maxConcurrentRunsPerHost,
+              admissionHostKey,
             });
           }
           return tx.transaction(async (claimTx) => {
@@ -1602,6 +1653,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               !(await admitGlobalRunSlot(
                 claimTx as unknown as Db,
                 globalMaxConcurrentRuns,
+              )) ||
+              !(await admitHostRunSlot(
+                claimTx as unknown as Db,
+                maxConcurrentRunsPerHost,
+                admissionHostKey,
               ))
             ) {
               return null;
