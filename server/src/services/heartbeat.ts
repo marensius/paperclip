@@ -743,6 +743,7 @@ export interface HeartbeatServiceOptions {
   environmentRuntime?: HeartbeatEnvironmentRuntime;
   runtimeEnv?: Record<string, string | undefined>;
   globalMaxConcurrentRuns?: number;
+  maxConcurrentRunsPerHost?: number;
   /**
    * Provider-boundary seam for persisted native-run recovery tests. Keeping
    * the seam here exercises the production reaper, claim, execution, package

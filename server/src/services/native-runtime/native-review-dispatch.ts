@@ -7,6 +7,7 @@ import {
   admitGlobalRunSlot,
   resolveGlobalMaxConcurrentRuns,
 } from "../heartbeat/global-run-admission.js";
+import { admitHostRunSlot } from "../heartbeat/host-run-admission.js";
 
 /** The run, wake, and issue lock form one reviewer admission claim. */
 export async function claimQueuedNativeReviewRun(db: Db, input: {
@@ -15,6 +16,8 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
   claimedAt: Date;
   claimValues: PgUpdateSetSource<typeof heartbeatRuns>;
   globalMaxConcurrentRuns?: number;
+  maxConcurrentRunsPerHost?: number;
+  admissionHostKey?: string | null;
 }): Promise<typeof heartbeatRuns.$inferSelect | null> {
   const context = input.run.contextSnapshot as Record<string, unknown> | null;
   const issueId = context?.issueId;
@@ -24,6 +27,11 @@ export async function claimQueuedNativeReviewRun(db: Db, input: {
       !(await admitGlobalRunSlot(
         tx as unknown as Db,
         input.globalMaxConcurrentRuns ?? resolveGlobalMaxConcurrentRuns(),
+      )) ||
+      !(await admitHostRunSlot(
+        tx as unknown as Db,
+        input.maxConcurrentRunsPerHost ?? 0,
+        input.admissionHostKey ?? null,
       ))
     ) {
       return null;
