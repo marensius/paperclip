@@ -1524,6 +1524,9 @@ describe("sandbox callback bridge", () => {
     "/api/heartbeat-runs/run-1/issues",
     "/api/issues/issue-1/runs",
     "/api/issues/issue-1/recovery-actions",
+    "/api/issues/issue-1/diagnostics/blockers",
+    "/api/issues/issue-1/diagnostics/subtree",
+    "/api/issues/issue-1/diagnostics/wakes",
   ])("admits only GET for diagnostic path %s on both transports", (requestPath) => {
     for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
       expect(authorizeSandboxCallbackBridgeRequestWithRoutes({ method: "GET", path: requestPath }, routes)).toBeNull();
