@@ -1597,6 +1597,9 @@ describe("sandbox callback bridge", () => {
       { method: "POST", path: "/api/issues/issue-1/checkout" },
       { method: "POST", path: "/api/issues/issue-1/release" },
       { method: "PATCH", path: "/api/issues/issue-1" },
+      { method: "POST", path: "/api/issues/issue-1/inbox-archive" },
+      { method: "DELETE", path: "/api/issues/issue-1/inbox-archive" },
+      { method: "DELETE", path: "/api/issues/issue-1" },
       { method: "GET", path: "/api/issues/issue-1/approvals" },
       { method: "GET", path: "/api/issues/issue-1/work-products" },
       { method: "POST", path: "/api/issues/issue-1/work-products" },
@@ -1667,6 +1670,11 @@ describe("sandbox callback bridge", () => {
       { method: "DELETE", path: "/api/issues/issue-1/documents/plan" },
       { method: "DELETE", path: "/api/issues/issue-1/approvals/ap-1" },
       { method: "DELETE", path: "/api/work-products/wp-1" },
+      // The archive and delete rules must not over-match sibling subresources
+      // or admit the wrong method.
+      { method: "GET", path: "/api/issues/issue-1/inbox-archive" },
+      { method: "POST", path: "/api/issues/issue-1/inbox-archive/extra" },
+      { method: "DELETE", path: "/api/issues/issue-1/comments" },
       { method: "POST", path: "/api/approvals/ap-1/approve" },
       { method: "POST", path: "/api/approvals/ap-1/reject" },
       { method: "POST", path: "/api/companies/co-1/logo" },
