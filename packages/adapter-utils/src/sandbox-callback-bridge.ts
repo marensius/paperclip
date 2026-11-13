@@ -170,7 +170,7 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/companies\/[^/]+\/email\/send$/ },
 
   // Issue lifecycle: read context, checkout, update, comment, document,
-  // release, archive, delete
+  // release, inbox archive/unarchive
   { method: "GET", path: /^\/api\/issues\/[^/]+$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/heartbeat-context$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/diagnostics\/wakes$/ },
@@ -185,12 +185,11 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/api\/issues\/[^/]+\/checkout$/ },
   { method: "POST", path: /^\/api\/issues\/[^/]+\/release$/ },
   { method: "PATCH", path: /^\/api\/issues\/[^/]+$/ },
-  // Inbox archive and hard delete. The server still enforces actor-level
-  // inbox:manage / issue:mutate authority and target-user policy; this only
-  // admits the documented archive and retention routes through the bridge.
+  // Inbox archive/unarchive only. Hard delete (DELETE /api/issues/:id) is
+  // deliberately not admitted through the bridge. The server still enforces
+  // actor-level inbox:manage authority and target-user policy.
   { method: "POST", path: /^\/api\/issues\/[^/]+\/inbox-archive$/ },
   { method: "DELETE", path: /^\/api\/issues\/[^/]+\/inbox-archive$/ },
-  { method: "DELETE", path: /^\/api\/issues\/[^/]+$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/approvals$/ },
 
   // Files: the queue encodes binary bodies; HTTP/2 carries the same bytes directly.
