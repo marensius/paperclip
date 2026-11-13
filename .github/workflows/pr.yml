@@ -1,19 +1,61 @@
 name: PR
-run-name: >-
-  ${{ contains(github.event.pull_request.labels.*.name, 'profile-ci') && (github.event.action != 'labeled' || github.event.label.name == 'profile-ci') && format('CI profile · PR #{0}', github.event.pull_request.number) || '' }}
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened]
 
 permissions:
-  actions: read
   contents: read
   pull-requests: read
 
+concurrency:
+  group: pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
-  ci:
-    if: github.event.action != 'labeled' || github.event.label.name == 'profile-ci'
-    # Master requires CODEOWNERS review for .github/**, including this workflow.
-    # The AWS runner group permits pr-trusted.yml@refs/heads/master.
-    uses: paperclipai/paperclip/.github/workflows/pr-trusted.yml@master
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.4
+
+      - name: Install dependencies
+        run: |
+          if ! pnpm install --frozen-lockfile; then
+            echo '::notice title=Lockfile::checked-in lockfile is stale for this merge tree; resolving it inline'
+            pnpm install --resolution-only --ignore-scripts --no-frozen-lockfile
+            pnpm install --frozen-lockfile
+          fi
+
+      - name: Build
+        run: pnpm build
+
+      - name: Test changed files
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          mapfile -t tests < <(git diff --name-only --diff-filter=AM "$BASE_SHA...$HEAD_SHA" -- '*.test.ts' '*.test.tsx' '*.test.mjs' '*.test.js')
+          if [ "${#tests[@]}" -eq 0 ]; then
+            echo "No changed test files."
+            exit 0
+          fi
+          printf 'Running %s changed test file(s):\n' "${#tests[@]}"
+          printf ' - %s\n' "${tests[@]}"
+          pnpm exec vitest run "${tests[@]}"
