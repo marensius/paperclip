@@ -1716,4 +1716,4 @@ skill-file mutations and recovery-action resolution remain restricted.
 
 | Method | Path | Notes |
 | ------ | ---- | ----- |
-| POST   | `/api/companies/:companyId/issues/retention-purge` | Deletes at most 100 archived `done`/`cancelled` issues older than the retention window; skips issues with children, cases, decisions, pending approvals or interactions, active recovery, an active checkout, or a scheduled monitor; supports `dryRun`; commits attachment cleanup to a retryable outbox |
+| POST   | `/api/companies/:companyId/issues/retention-purge` | Deletes at most 100 `done`/`cancelled` issues older than the retention window that carry an agent-attributed retention archive from an identity holding `issues:retention_delete` (a personal inbox archive never qualifies); skips referenced or running issues; supports `dryRun`; commits attachment cleanup to a retryable outbox |

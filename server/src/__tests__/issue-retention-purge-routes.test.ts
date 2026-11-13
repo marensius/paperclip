@@ -192,6 +192,8 @@ describeEmbeddedPostgres("issue retention purge route", () => {
       status: "done" | "cancelled" | "todo" | "in_progress";
       ageDays?: number;
       archived?: boolean;
+      archiveActor?: "user" | "agent";
+      archiveAgentId?: string | null;
       extra?: Partial<typeof issues.$inferInsert>;
     },
   ) {
@@ -211,10 +213,18 @@ describeEmbeddedPostgres("issue retention purge route", () => {
       ...input.extra,
     });
     if (input.archived !== false) {
+      const archiveActor = input.archiveActor ?? "agent";
       await db.insert(issueInboxArchives).values({
         companyId: seed.companyId,
         issueId: id,
         userId: seed.userId,
+        archivedByActorType: archiveActor,
+        archivedByAgentId:
+          archiveActor === "agent"
+            ? input.archiveAgentId === undefined
+              ? seed.agentId
+              : input.archiveAgentId
+            : null,
         archivedAt: terminalAt,
       });
     }
@@ -555,6 +565,7 @@ describeEmbeddedPostgres("issue retention purge route", () => {
 
   it("re-evaluates the policy under the lock and refuses a re-completed issue", async () => {
     const seed = await seedCompany();
+    await grant(seed, "issues:retention_delete");
     const issueId = await addIssue(seed, { status: "done", ageDays: 10 });
     const assetId = randomUUID();
     await db.insert(assets).values({
@@ -708,5 +719,49 @@ describeEmbeddedPostgres("issue retention purge route", () => {
         (row) => row.status === "done",
       ),
     ).toBe(true);
+  });
+
+  it("requires an agent-attributed archive from an identity holding the retention grant", async () => {
+    const seed = await seedCompany();
+    await grant(seed, "issues:retention_delete");
+    const otherAgentId = randomUUID();
+    await db.insert(agents).values({
+      id: otherAgentId,
+      companyId: seed.companyId,
+      name: "Unrelated Agent",
+      role: "engineer",
+      status: "active",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+
+    const designated = await addIssue(seed, { status: "done", ageDays: 10 });
+    // A user's personal inbox archive is not a retention signal: it must not
+    // make the issue deletable for every other user in the company.
+    const userArchived = await addIssue(seed, {
+      status: "done",
+      ageDays: 12,
+      archiveActor: "user",
+    });
+    // An agent archive only counts for the identity that holds the dedicated
+    // retention grant, not for every agent that can manage an inbox.
+    const agentWithoutGrant = await addIssue(seed, {
+      status: "done",
+      ageDays: 8,
+      archiveActor: "agent",
+      archiveAgentId: otherAgentId,
+    });
+
+    const response = await purge(seed, boardActor(seed)).expect(200);
+    expect(response.body.deleted.map((row: { id: string }) => row.id)).toEqual([designated]);
+
+    const remaining = new Set(
+      (await db.select({ id: issues.id }).from(issues)).map((row) => row.id),
+    );
+    expect(remaining.has(designated)).toBe(false);
+    expect(remaining.has(userArchived)).toBe(true);
+    expect(remaining.has(agentWithoutGrant)).toBe(true);
   });
 });

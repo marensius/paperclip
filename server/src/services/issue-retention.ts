@@ -24,6 +24,7 @@ import {
   issueWatchdogs,
   issues,
   pipelineCaseIssueLinks,
+  principalPermissionGrants,
   toolActionDeliveries,
 } from "@paperclipai/db";
 
@@ -77,7 +78,9 @@ function archivedAtExpression(companyId: string) {
   return sql<Date>`(
     select max(a.archived_at)
     from ${issueInboxArchives} a
-    where a.company_id = ${companyId} and a.issue_id = ${sql.raw('"issues"."id"')}
+    where a.company_id = ${companyId}
+      and a.issue_id = ${sql.raw('"issues"."id"')}
+      and a.archived_by_actor_type = 'agent'
   )`;
 }
 
@@ -101,9 +104,22 @@ export function retentionEligibilityCondition(companyId: string, cutoff: Date): 
     isNull(issues.executionRunId),
     isNull(issues.monitorNextCheckAt),
     sql`${terminalAt} <= ${cutoff.toISOString()}::timestamptz`,
+    // Explicit retention evidence. `issue_inbox_archives` is per user, so an
+    // unrelated user's inbox archive must never authorize a company-wide hard
+    // delete. Only an agent-attributed archive written by an identity that
+    // currently holds the dedicated retention grant counts as a retention
+    // archive. Revoking the grant fails closed on the next purge pass.
     sql`exists (
-      select 1 from ${issueInboxArchives} a
-      where a.company_id = ${companyId} and a.issue_id = ${issues.id}
+      select 1
+      from ${issueInboxArchives} a
+      join ${principalPermissionGrants} g
+        on g.company_id = a.company_id
+       and g.principal_type = 'agent'
+       and g.principal_id = a.archived_by_agent_id::text
+       and g.permission_key = 'issues:retention_delete'
+      where a.company_id = ${companyId}
+        and a.issue_id = ${issues.id}
+        and a.archived_by_actor_type = 'agent'
     )`,
     // A parent row is referenced by its children without a delete policy,
     // so any child (open or terminal) blocks the delete. Skipping the

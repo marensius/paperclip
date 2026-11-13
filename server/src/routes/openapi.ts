@@ -4284,7 +4284,7 @@ registry.registerPath({
   tags: ["issues"],
   summary: "Purge retention-eligible archived issues",
   description:
-    "Server-owned hard delete for the retention routine. Requires `issues:retention_delete`. The caller never supplies issue IDs: the server selects archived `done`/`cancelled` issues older than the retention window and skips issues with children, cases, decisions, pending approvals or interactions, active recovery, an active checkout, or a scheduled monitor. Batches are capped at 100 and every delete is audited. Use `dryRun` to preview the eligible candidates. Attachment object cleanup is committed to a durable outbox in the same transaction and drained after the batch; failed rows stay pending and are retried on a later purge pass.",
+    "Server-owned hard delete for the retention routine. Requires `issues:retention_delete`. The caller never supplies issue IDs: the server selects `done`/`cancelled` issues older than the retention window that carry an agent-attributed retention archive written by an identity that currently holds `issues:retention_delete` (a per-user inbox archive from another user never qualifies), and skips issues with children, cases, decisions, pending approvals or interactions, active recovery, an active checkout, or a scheduled monitor. Batches are capped at 100 and every delete is audited. Use `dryRun` to preview the eligible candidates. Attachment object cleanup is committed to a durable outbox in the same transaction and drained after the batch; failed rows stay pending and are retried on a later purge pass.",
   request: {
     params: z.object({ companyId: z.string() }),
     body: jsonBody(
