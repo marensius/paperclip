@@ -173,6 +173,8 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   // release, inbox archive/unarchive
   { method: "GET", path: /^\/api\/issues\/[^/]+$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/heartbeat-context$/ },
+  { method: "GET", path: /^\/api\/issues\/[^/]+\/diagnostics\/blockers$/ },
+  { method: "GET", path: /^\/api\/issues\/[^/]+\/diagnostics\/subtree$/ },
   { method: "GET", path: /^\/api\/issues\/[^/]+\/diagnostics\/wakes$/ },
   { method: "POST", path: /^\/api\/issues\/[^/]+\/monitor\/check-now$/ },
   // The controller still checks company membership and issue read authority.
