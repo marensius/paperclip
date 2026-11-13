@@ -1711,3 +1711,9 @@ parameter to read a referenced script or instruction file.
 Bridge admission does not grant resource access. The controller rechecks company,
 task and skill visibility, and monitor-management permission. Asset mutations,
 skill-file mutations and recovery-action resolution remain restricted.
+
+**Retention purge route.** Server-owned hard delete for the retention routine; requires `issues:retention_delete` and never accepts caller-named IDs.
+
+| Method | Path | Notes |
+| ------ | ---- | ----- |
+| POST   | `/api/companies/:companyId/issues/retention-purge` | Deletes at most 100 archived `done`/`cancelled` issues older than the retention window; skips issues with children, cases, decisions, pending approvals or interactions, active recovery, an active checkout, or a scheduled monitor; supports `dryRun`; commits attachment cleanup to a retryable outbox |
