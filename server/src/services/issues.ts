@@ -76,6 +76,7 @@ import {
   issueApprovals,
   issueAccessGrants,
   issueAttachments,
+  issueAttachmentCleanupOutbox,
   issueCreateIdempotencyKeys,
   issueInboxArchives,
   issueLabels,
@@ -11704,7 +11705,6 @@ export function issueService(db: Db) {
             cutoff: string;
           };
         };
-        cleanupAttachments?: () => Promise<void>;
       } = {},
     ) =>
       db.transaction(async (tx) => {
@@ -11727,9 +11727,13 @@ export function issueService(db: Db) {
             throw conflict("Issue is no longer retention-eligible.");
           }
         }
-        const attachmentAssetIds = await tx
-          .select({ assetId: issueAttachments.assetId })
+        const attachmentObjects = await tx
+          .select({
+            assetId: issueAttachments.assetId,
+            objectKey: assets.objectKey,
+          })
           .from(issueAttachments)
+          .innerJoin(assets, eq(issueAttachments.assetId, assets.id))
           .where(eq(issueAttachments.issueId, id));
         const issueDocumentIds = await tx
           .select({ documentId: issueDocuments.documentId })
@@ -11758,11 +11762,11 @@ export function issueService(db: Db) {
           throw err;
         }
 
-        if (removedIssue && attachmentAssetIds.length > 0) {
+        if (removedIssue && attachmentObjects.length > 0) {
           await tx.delete(assets).where(
             inArray(
               assets.id,
-              attachmentAssetIds.map((row) => row.assetId),
+              attachmentObjects.map((row) => row.assetId),
             ),
           );
         }
@@ -11778,10 +11782,22 @@ export function issueService(db: Db) {
 
         if (!removedIssue) return null;
 
-        if (options.cleanupAttachments) {
-          // Run inside the transaction so a storage failure rolls the delete
-          // back and leaves the issue retryable on the next purge pass.
-          await options.cleanupAttachments();
+        if (options.requireRetentionEligible && attachmentObjects.length > 0) {
+          // Commit the cleanup intent in the same transaction as the issue
+          // delete. Object-store deletion happens only after this commit, so a
+          // rollback can never leave a live issue referencing a removed
+          // object. Depending on the object key keeps the outbox idempotent.
+          await tx
+            .insert(issueAttachmentCleanupOutbox)
+            .values(
+              attachmentObjects.map((row) => ({
+                companyId: options.requireRetentionEligible!.companyId,
+                issueId: id,
+                assetId: row.assetId,
+                objectKey: row.objectKey,
+              })),
+            )
+            .onConflictDoNothing();
         }
 
         if (options.requireRetentionEligible) {

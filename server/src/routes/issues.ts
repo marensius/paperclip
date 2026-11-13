@@ -1,4 +1,10 @@
-import { ISSUE_RETENTION_MIN_DAYS, issueRetentionBatchLimit, issueRetentionCutoff, issueRetentionService } from "../services/issue-retention.js";
+import {
+  ISSUE_RETENTION_MIN_DAYS,
+  drainIssueAttachmentCleanupOutbox,
+  issueRetentionBatchLimit,
+  issueRetentionCutoff,
+  issueRetentionService,
+} from "../services/issue-retention.js";
 import { taskInterruptionPresentation, taskInterruptionPresentations } from "../services/task-interruption-presentation.js";
 import { parseObject } from "../adapters/utils.js";
 import { prepareRestrictedWorkspaceRetry } from "../services/restricted-workspace-retry.js";
@@ -16012,14 +16018,10 @@ export function issueRoutes(
       }> = [];
 
       for (const candidate of candidates) {
-        const attachments = await svc.listAttachments(candidate.id);
-        const cleanupState: {
-          failure: { attachmentId: string; objectKey: string; message: string } | null;
-        } = { failure: null };
         try {
-          // Attachment cleanup and the audit row run inside the delete
-          // transaction. A storage failure rolls the delete back and leaves the
-          // issue eligible for the next purge pass.
+          // The attachment cleanup intent is committed in the same transaction
+          // as the issue delete, then drained from the outbox after commit.
+          // Object deletion therefore never happens before the DB commit.
           const removed = await svc.remove(candidate.id, {
             requireRetentionEligible: {
               companyId,
@@ -16038,20 +16040,6 @@ export function issueRoutes(
                 cutoff: cutoff.toISOString(),
               },
             },
-            cleanupAttachments: async () => {
-              for (const attachment of attachments) {
-                try {
-                  await storage.deleteObject(attachment.companyId, attachment.objectKey);
-                } catch (err) {
-                  cleanupState.failure = {
-                    attachmentId: attachment.id,
-                    objectKey: attachment.objectKey,
-                    message: err instanceof Error ? err.message : String(err),
-                  };
-                  throw err;
-                }
-              }
-            },
           });
           if (!removed) {
             skipped.push({
@@ -16069,15 +16057,6 @@ export function issueRoutes(
             archivedAt: new Date(candidate.archivedAt).toISOString(),
           });
         } catch (error) {
-          if (cleanupState.failure) {
-            skipped.push({
-              id: candidate.id,
-              identifier: candidate.identifier,
-              reason: "attachment_cleanup_failed",
-              details: cleanupState.failure,
-            });
-            continue;
-          }
           // A foreign key or concurrent state change can still block a row that
           // the eligibility query selected. Skip it and keep the batch moving.
           if (error instanceof HttpError && error.status === 409) {
@@ -16092,6 +16071,13 @@ export function issueRoutes(
         }
       }
 
+      // Idempotent and retryable: a storage failure leaves the outbox row
+      // pending for the next purge pass instead of rolling back a committed
+      // issue delete or leaving a live issue with a missing attachment.
+      const attachmentCleanup = await drainIssueAttachmentCleanupOutbox(db, storage, {
+        companyId,
+      });
+
       res.json({
         policy: "issue-retention.v1",
         cutoff: cutoff.toISOString(),
@@ -16100,6 +16086,7 @@ export function issueRoutes(
         deleted,
         skipped,
         hasMore,
+        attachmentCleanup,
       });
     },
   );

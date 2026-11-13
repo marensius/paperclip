@@ -1,5 +1,6 @@
-import { and, asc, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
+import { and, asc, count, eq, inArray, isNull, sql, type SQL } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
+import type { StorageService } from "../storage/types.js";
 import {
   approvals,
   caseAccessSources,
@@ -12,6 +13,7 @@ import {
   decisionTrainingExamples,
   decisions,
   issueApprovals,
+  issueAttachmentCleanupOutbox,
   issueInboxArchives,
   issueRecoveryActions,
   issueReferenceMentions,
@@ -232,4 +234,81 @@ export function issueRetentionService(db: Db) {
   }
 
   return { listEligible };
+}
+
+/**
+ * Idempotently drains pending attachment object deletions that were committed
+ * together with a retention delete. A storage failure only leaves the row
+ * pending with its attempt/error metadata; the issue and attachment rows are
+ * already gone, so no live issue can reference a missing object. The next
+ * purge pass retries the object deletion.
+ */
+export async function drainIssueAttachmentCleanupOutbox(
+  db: Db,
+  storage: Pick<StorageService, "deleteObject">,
+  input: { companyId: string; limit?: number | null },
+): Promise<{ completed: number; failed: number; pending: number }> {
+  const limit = Math.min(
+    500,
+    Math.max(1, Math.trunc(input.limit ?? ISSUE_RETENTION_MAX_BATCH)),
+  );
+  const rows = await db
+    .select({
+      id: issueAttachmentCleanupOutbox.id,
+      companyId: issueAttachmentCleanupOutbox.companyId,
+      objectKey: issueAttachmentCleanupOutbox.objectKey,
+    })
+    .from(issueAttachmentCleanupOutbox)
+    .where(
+      and(
+        eq(issueAttachmentCleanupOutbox.companyId, input.companyId),
+        eq(issueAttachmentCleanupOutbox.status, "pending"),
+      ),
+    )
+    .orderBy(asc(issueAttachmentCleanupOutbox.createdAt))
+    .limit(limit);
+
+  let completed = 0;
+  let failed = 0;
+  for (const row of rows) {
+    const now = new Date();
+    try {
+      await storage.deleteObject(row.companyId, row.objectKey);
+      await db
+        .update(issueAttachmentCleanupOutbox)
+        .set({
+          status: "done",
+          attemptCount: sql`${issueAttachmentCleanupOutbox.attemptCount} + 1`,
+          lastAttemptAt: now,
+          lastError: null,
+          completedAt: now,
+          updatedAt: now,
+        })
+        .where(eq(issueAttachmentCleanupOutbox.id, row.id));
+      completed += 1;
+    } catch (error) {
+      failed += 1;
+      await db
+        .update(issueAttachmentCleanupOutbox)
+        .set({
+          attemptCount: sql`${issueAttachmentCleanupOutbox.attemptCount} + 1`,
+          lastAttemptAt: now,
+          lastError: (error instanceof Error ? error.message : String(error)).slice(0, 1000),
+          updatedAt: now,
+        })
+        .where(eq(issueAttachmentCleanupOutbox.id, row.id));
+    }
+  }
+
+  const [pending] = await db
+    .select({ value: count() })
+    .from(issueAttachmentCleanupOutbox)
+    .where(
+      and(
+        eq(issueAttachmentCleanupOutbox.companyId, input.companyId),
+        eq(issueAttachmentCleanupOutbox.status, "pending"),
+      ),
+    );
+
+  return { completed, failed, pending: Number(pending?.value ?? 0) };
 }

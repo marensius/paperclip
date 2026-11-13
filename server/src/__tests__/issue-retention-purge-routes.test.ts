@@ -21,6 +21,7 @@ import {
   heartbeatRuns,
   issueApprovals,
   issueAttachments,
+  issueAttachmentCleanupOutbox,
   issueInboxArchives,
   issueRecoveryActions,
   issueReferenceMentions,
@@ -58,6 +59,7 @@ describeEmbeddedPostgres("issue retention purge route", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(issueAttachmentCleanupOutbox);
     await db.delete(toolActionDeliveries);
     await db.delete(chatTaskHandoffs);
     await db.delete(issueReferenceMentions);
@@ -554,6 +556,22 @@ describeEmbeddedPostgres("issue retention purge route", () => {
   it("re-evaluates the policy under the lock and refuses a re-completed issue", async () => {
     const seed = await seedCompany();
     const issueId = await addIssue(seed, { status: "done", ageDays: 10 });
+    const assetId = randomUUID();
+    await db.insert(assets).values({
+      id: assetId,
+      companyId: seed.companyId,
+      provider: "local",
+      objectKey: `retention/${assetId}`,
+      contentType: "text/plain",
+      byteSize: 5,
+      sha256: "0".repeat(64),
+      createdByUserId: seed.userId,
+    });
+    await db.insert(issueAttachments).values({
+      companyId: seed.companyId,
+      issueId,
+      assetId,
+    });
     const svc = issueService(db);
 
     // Simulate a reopen and fresh re-completion between selection and delete:
@@ -588,68 +606,107 @@ describeEmbeddedPostgres("issue retention purge route", () => {
     expect(
       (await db.select({ id: issues.id }).from(issues)).map((row) => row.id),
     ).toContain(issueId);
+    // A rolled-back delete must not enqueue any object cleanup.
+    expect(await db.select().from(issueAttachmentCleanupOutbox)).toHaveLength(0);
+    expect(
+      (await db.select().from(issueAttachments)).filter((row) => row.issueId === issueId),
+    ).toHaveLength(1);
   });
 
-  it("rolls back the delete when attachment cleanup fails, then retries it", async () => {
+  it("commits the delete and cleanup outbox before touching object storage, then retries partial cleanup", async () => {
     const seed = await seedCompany();
     await grant(seed, "issues:retention_delete");
     const issueId = await addIssue(seed, { status: "done", ageDays: 10 });
-    const assetId = randomUUID();
-    await db.insert(assets).values({
-      id: assetId,
-      companyId: seed.companyId,
-      provider: "local",
-      objectKey: `retention/${assetId}`,
-      contentType: "text/plain",
-      byteSize: 5,
-      sha256: "0".repeat(64),
-      createdByUserId: seed.userId,
-    });
-    await db.insert(issueAttachments).values({
-      companyId: seed.companyId,
-      issueId,
-      assetId,
-    });
+    const assetIds = [randomUUID(), randomUUID()];
+    for (const assetId of assetIds) {
+      await db.insert(assets).values({
+        id: assetId,
+        companyId: seed.companyId,
+        provider: "local",
+        objectKey: `retention/${assetId}`,
+        contentType: "text/plain",
+        byteSize: 5,
+        sha256: "0".repeat(64),
+        createdByUserId: seed.userId,
+      });
+      await db.insert(issueAttachments).values({
+        companyId: seed.companyId,
+        issueId,
+        assetId,
+      });
+    }
+    const objectKeys = assetIds.map((assetId) => `retention/${assetId}`).sort();
 
-    const failing = await request(
+    // Fail the second object deletion to model a partial multi-attachment
+    // cleanup. The issue delete and the outbox rows have already committed,
+    // so no live issue can be left pointing at a missing object.
+    const attempted: string[] = [];
+    const partial = await request(
       appFor(boardActor(seed), {
-        deleteObject: async () => {
-          throw new Error("storage unavailable");
+        deleteObject: async (_companyId: string, objectKey: string) => {
+          attempted.push(objectKey);
+          if (attempted.length === 2) throw new Error("storage unavailable");
         },
       }),
     )
       .post(`/api/companies/${seed.companyId}/issues/retention-purge`)
       .send({})
       .expect(200);
-    expect(failing.body.deleted).toEqual([]);
-    expect(failing.body.skipped).toEqual([
-      expect.objectContaining({
-        id: issueId,
-        reason: "attachment_cleanup_failed",
-        details: expect.objectContaining({
-          attachmentId: expect.any(String),
-          objectKey: `retention/${assetId}`,
-        }),
-      }),
-    ]);
+    expect(partial.body.deleted.map((row: { id: string }) => row.id)).toEqual([issueId]);
+    expect(partial.body.skipped).toEqual([]);
+    expect(partial.body.attachmentCleanup).toEqual({
+      completed: 1,
+      failed: 1,
+      pending: 1,
+    });
+    expect([...attempted].sort()).toEqual(objectKeys);
+
+    const remainingIssues = await db.select({ id: issues.id }).from(issues);
+    expect(remainingIssues.map((row) => row.id)).not.toContain(issueId);
     expect(
-      (await db.select({ id: issues.id }).from(issues)).map((row) => row.id),
-    ).toContain(issueId);
+      (await db.select().from(issueAttachments)).filter((row) => row.issueId === issueId),
+    ).toHaveLength(0);
+    expect(
+      (await db.select().from(assets)).filter((row) => assetIds.includes(row.id)),
+    ).toHaveLength(0);
     expect(
       (await db.select().from(activityLog)).filter(
         (row) => row.action === "issue.retention_deleted",
       ),
-    ).toHaveLength(0);
+    ).toHaveLength(1);
 
+    const outbox = await db.select().from(issueAttachmentCleanupOutbox);
+    expect(outbox).toHaveLength(2);
+    expect(outbox.filter((row) => row.status === "done")).toHaveLength(1);
+    const pending = outbox.filter((row) => row.status === "pending");
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.lastError).toContain("storage unavailable");
+
+    // A later purge pass retries the pending object without re-deleting the
+    // (already gone) issue. The object deletion is idempotent.
+    const retried: string[] = [];
     const retry = await request(
-      appFor(boardActor(seed), { deleteObject: async () => {} }),
+      appFor(boardActor(seed), {
+        deleteObject: async (_companyId: string, objectKey: string) => {
+          retried.push(objectKey);
+        },
+      }),
     )
       .post(`/api/companies/${seed.companyId}/issues/retention-purge`)
       .send({})
       .expect(200);
-    expect(retry.body.deleted.map((row: { id: string }) => row.id)).toEqual([issueId]);
+    expect(retry.body.deleted).toEqual([]);
+    expect(retry.body.attachmentCleanup).toEqual({
+      completed: 1,
+      failed: 0,
+      pending: 0,
+    });
+    expect(retried).toHaveLength(1);
+    expect(objectKeys).toContain(retried[0]);
     expect(
-      (await db.select({ id: issues.id }).from(issues)).map((row) => row.id),
-    ).not.toContain(issueId);
+      (await db.select().from(issueAttachmentCleanupOutbox)).every(
+        (row) => row.status === "done",
+      ),
+    ).toBe(true);
   });
 });
