@@ -16008,15 +16008,51 @@ export function issueRoutes(
         id: string;
         identifier: string | null;
         reason: string;
+        details?: Record<string, unknown> | null;
       }> = [];
 
       for (const candidate of candidates) {
+        const attachments = await svc.listAttachments(candidate.id);
+        const cleanupState: {
+          failure: { attachmentId: string; objectKey: string; message: string } | null;
+        } = { failure: null };
         try {
-          // Reuse the exact attachment cleanup the explicit board delete route
-          // performs, but only for issues this server-side query already
-          // classified as retention-eligible.
-          const attachments = await svc.listAttachments(candidate.id);
-          const removed = await svc.remove(candidate.id, { requireRetentionEligible: true });
+          // Attachment cleanup and the audit row run inside the delete
+          // transaction. A storage failure rolls the delete back and leaves the
+          // issue eligible for the next purge pass.
+          const removed = await svc.remove(candidate.id, {
+            requireRetentionEligible: {
+              companyId,
+              cutoff,
+              audit: {
+                actorType: actor.actorType,
+                actorId: actor.actorId,
+                agentId: actor.agentId,
+                runId: actor.runId,
+                agentApiKeyId: actor.agentApiKeyId,
+                retentionDays,
+                identifier: candidate.identifier,
+                status: candidate.status,
+                terminalAt: new Date(candidate.terminalAt).toISOString(),
+                archivedAt: new Date(candidate.archivedAt).toISOString(),
+                cutoff: cutoff.toISOString(),
+              },
+            },
+            cleanupAttachments: async () => {
+              for (const attachment of attachments) {
+                try {
+                  await storage.deleteObject(attachment.companyId, attachment.objectKey);
+                } catch (err) {
+                  cleanupState.failure = {
+                    attachmentId: attachment.id,
+                    objectKey: attachment.objectKey,
+                    message: err instanceof Error ? err.message : String(err),
+                  };
+                  throw err;
+                }
+              }
+            },
+          });
           if (!removed) {
             skipped.push({
               id: candidate.id,
@@ -16025,16 +16061,6 @@ export function issueRoutes(
             });
             continue;
           }
-          for (const attachment of attachments) {
-            try {
-              await storage.deleteObject(attachment.companyId, attachment.objectKey);
-            } catch (err) {
-              logger.warn(
-                { err, issueId: candidate.id, attachmentId: attachment.id },
-                "failed to delete attachment object during issue retention purge",
-              );
-            }
-          }
           deleted.push({
             id: candidate.id,
             identifier: candidate.identifier,
@@ -16042,27 +16068,16 @@ export function issueRoutes(
             terminalAt: new Date(candidate.terminalAt).toISOString(),
             archivedAt: new Date(candidate.archivedAt).toISOString(),
           });
-          await logActivity(db, {
-            companyId,
-            actorType: actor.actorType,
-            actorId: actor.actorId,
-            agentId: actor.agentId,
-            runId: actor.runId,
-            agentApiKeyId: actor.agentApiKeyId,
-            action: "issue.retention_deleted",
-            entityType: "issue",
-            entityId: candidate.id,
-            details: {
-              identifier: candidate.identifier,
-              status: candidate.status,
-              terminalAt: new Date(candidate.terminalAt).toISOString(),
-              archivedAt: new Date(candidate.archivedAt).toISOString(),
-              retentionDays,
-              cutoff: cutoff.toISOString(),
-              policy: "issue-retention.v1",
-            },
-          });
         } catch (error) {
+          if (cleanupState.failure) {
+            skipped.push({
+              id: candidate.id,
+              identifier: candidate.identifier,
+              reason: "attachment_cleanup_failed",
+              details: cleanupState.failure,
+            });
+            continue;
+          }
           // A foreign key or concurrent state change can still block a row that
           // the eligibility query selected. Skip it and keep the batch moving.
           if (error instanceof HttpError && error.status === 409) {

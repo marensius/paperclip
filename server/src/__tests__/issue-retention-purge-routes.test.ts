@@ -1,28 +1,43 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
+import { eq } from "drizzle-orm";
 import request from "supertest";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
   agents,
   approvals,
+  assets,
   authUsers,
   cases,
+  chatTaskHandoffs,
   companies,
   companyMemberships,
   createDb,
+  decisionEffectExecutions,
   decisionTargetIssues,
+  decisionTrainingExamples,
   decisions,
   heartbeatRuns,
   issueApprovals,
+  issueAttachments,
   issueInboxArchives,
   issueRecoveryActions,
+  issueReferenceMentions,
+  issueRelations,
   issueThreadInteractions,
+  issueTreeHoldMembers,
+  issueTreeHolds,
+  issueWatchdogs,
   issues,
+  pipelineCaseIssueLinks,
   principalPermissionGrants,
+  toolActionDeliveries,
 } from "@paperclipai/db";
 import { errorHandler } from "../middleware/index.js";
 import { issueRoutes } from "../routes/issues.js";
+import { issueRetentionCutoff } from "../services/issue-retention.js";
+import { issueService } from "../services/issues.js";
 import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
@@ -43,14 +58,26 @@ describeEmbeddedPostgres("issue retention purge route", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(toolActionDeliveries);
+    await db.delete(chatTaskHandoffs);
+    await db.delete(issueReferenceMentions);
+    await db.delete(issueRelations);
+    await db.delete(issueTreeHoldMembers);
+    await db.delete(issueTreeHolds);
+    await db.delete(issueWatchdogs);
+    await db.delete(decisionTrainingExamples);
+    await db.delete(decisionEffectExecutions);
     await db.delete(decisionTargetIssues);
     await db.delete(decisions);
+    await db.delete(pipelineCaseIssueLinks);
     await db.delete(issueThreadInteractions);
     await db.delete(issueRecoveryActions);
     await db.delete(issueApprovals);
     await db.delete(approvals);
     await db.delete(cases);
     await db.delete(activityLog);
+    await db.delete(issueAttachments);
+    await db.delete(assets);
     await db.delete(issueInboxArchives);
     await db.delete(issues);
     await db.delete(heartbeatRuns);
@@ -65,14 +92,17 @@ describeEmbeddedPostgres("issue retention purge route", () => {
     await tempDb?.cleanup();
   });
 
-  function appFor(actor: Express.Request["actor"]) {
+  function appFor(
+    actor: Express.Request["actor"],
+    storage: Record<string, unknown> = {},
+  ) {
     const app = express();
     app.use(express.json());
     app.use((req, _res, next) => {
       req.actor = actor;
       next();
     });
-    app.use("/api", issueRoutes(db, {} as never));
+    app.use("/api", issueRoutes(db, storage as never));
     app.use(errorHandler);
     return app;
   }
@@ -315,6 +345,100 @@ describeEmbeddedPostgres("issue retention purge route", () => {
       payload: { version: 1, questions: [] } as never,
     });
 
+    // Cross-issue relationships must fail closed: deleting an old terminal
+    // issue must never remove an edge or binding that another workflow owns.
+    const withRelationTarget = await addIssue(seed, { status: "done", ageDays: 10 });
+    const relationSource = await addIssue(seed, { status: "todo", ageDays: 1, archived: false });
+    await db.insert(issueRelations).values({
+      companyId: seed.companyId,
+      issueId: relationSource,
+      relatedIssueId: withRelationTarget,
+      type: "blocks",
+    });
+
+    const withPrivacyChild = await addIssue(seed, { status: "done", ageDays: 10 });
+    await addIssue(seed, {
+      status: "todo",
+      ageDays: 1,
+      archived: false,
+      extra: {
+        privacyParentIssueId: withPrivacyChild,
+        privacyRootIssueId: withPrivacyChild,
+      },
+    });
+
+    const withTreeHold = await addIssue(seed, { status: "done", ageDays: 10 });
+    await db.insert(issueTreeHolds).values({
+      companyId: seed.companyId,
+      rootIssueId: withTreeHold,
+      mode: "retention-test",
+      status: "active",
+    });
+
+    const withTreeMember = await addIssue(seed, { status: "done", ageDays: 10 });
+    const treeHoldRoot = await addIssue(seed, { status: "todo", ageDays: 1, archived: false });
+    const treeHoldId = randomUUID();
+    await db.insert(issueTreeHolds).values({
+      id: treeHoldId,
+      companyId: seed.companyId,
+      rootIssueId: treeHoldRoot,
+      mode: "retention-test",
+      status: "active",
+    });
+    await db.insert(issueTreeHoldMembers).values({
+      companyId: seed.companyId,
+      holdId: treeHoldId,
+      issueId: withTreeMember,
+      issueTitle: "Retention member",
+      issueStatus: "done",
+    });
+
+    const withWatchdog = await addIssue(seed, { status: "done", ageDays: 10 });
+    await db.insert(issueWatchdogs).values({
+      companyId: seed.companyId,
+      issueId: withWatchdog,
+      watchdogAgentId: seed.agentId,
+      status: "active",
+    });
+
+    const withTrainingExample = await addIssue(seed, { status: "done", ageDays: 10 });
+    await db.insert(decisionTrainingExamples).values({
+      companyId: seed.companyId,
+      sourceKind: "interaction",
+      sourceId: randomUUID(),
+      issueId: withTrainingExample,
+      cutoffAt: seed.now,
+      snapshot: {} as never,
+      createdByUserId: seed.userId,
+    });
+
+    const withMentionTarget = await addIssue(seed, { status: "done", ageDays: 10 });
+    const mentionSource = await addIssue(seed, { status: "todo", ageDays: 1, archived: false });
+    await db.insert(issueReferenceMentions).values({
+      companyId: seed.companyId,
+      sourceIssueId: mentionSource,
+      targetIssueId: withMentionTarget,
+      sourceKind: "comment",
+    });
+
+    const withChatHandoff = await addIssue(seed, { status: "done", ageDays: 10 });
+    const conversationIssue = await addIssue(seed, { status: "todo", ageDays: 1, archived: false });
+    await db.insert(chatTaskHandoffs).values({
+      taskId: withChatHandoff,
+      companyId: seed.companyId,
+      conversationId: conversationIssue,
+      agentId: seed.agentId,
+      sessionGeneration: 1,
+    });
+
+    const withDecisionEffect = await addIssue(seed, { status: "done", ageDays: 10 });
+    await db.insert(decisionEffectExecutions).values({
+      decisionId,
+      effectIndex: 1,
+      effectType: "retention-test",
+      targetIssueId: withDecisionEffect,
+    });
+
     const response = await purge(seed, boardActor(seed)).expect(200);
     expect(response.body).toMatchObject({
       policy: "issue-retention.v1",
@@ -345,6 +469,15 @@ describeEmbeddedPostgres("issue retention purge route", () => {
       withPendingApproval,
       withActiveRecovery,
       withPendingInteraction,
+      withRelationTarget,
+      withPrivacyChild,
+      withTreeHold,
+      withTreeMember,
+      withWatchdog,
+      withTrainingExample,
+      withMentionTarget,
+      withChatHandoff,
+      withDecisionEffect,
     ]) {
       expect(remainingIds.has(kept)).toBe(true);
     }
@@ -416,5 +549,107 @@ describeEmbeddedPostgres("issue retention purge route", () => {
     const dryRun = await purge(seed, boardActor(seed), { dryRun: true }).expect(200);
     expect(dryRun.body).toMatchObject({ dryRun: true, deleted: [] });
     expect(dryRun.body.eligible.map((row: { id: string }) => row.id)).toEqual([]);
+  });
+
+  it("re-evaluates the policy under the lock and refuses a re-completed issue", async () => {
+    const seed = await seedCompany();
+    const issueId = await addIssue(seed, { status: "done", ageDays: 10 });
+    const svc = issueService(db);
+
+    // Simulate a reopen and fresh re-completion between selection and delete:
+    // the issue is terminal again but no longer older than the cutoff.
+    await db
+      .update(issues)
+      .set({ completedAt: seed.now, updatedAt: seed.now })
+      .where(eq(issues.id, issueId));
+
+    await expect(
+      svc.remove(issueId, {
+        requireRetentionEligible: {
+          companyId: seed.companyId,
+          cutoff: issueRetentionCutoff(seed.now, 7),
+          audit: {
+            actorType: "user",
+            actorId: seed.userId,
+            agentId: null,
+            runId: null,
+            agentApiKeyId: null,
+            retentionDays: 7,
+            identifier: null,
+            status: "done",
+            terminalAt: seed.now.toISOString(),
+            archivedAt: seed.now.toISOString(),
+            cutoff: issueRetentionCutoff(seed.now, 7).toISOString(),
+          },
+        },
+      }),
+    ).rejects.toThrow(/no longer retention-eligible/);
+
+    expect(
+      (await db.select({ id: issues.id }).from(issues)).map((row) => row.id),
+    ).toContain(issueId);
+  });
+
+  it("rolls back the delete when attachment cleanup fails, then retries it", async () => {
+    const seed = await seedCompany();
+    await grant(seed, "issues:retention_delete");
+    const issueId = await addIssue(seed, { status: "done", ageDays: 10 });
+    const assetId = randomUUID();
+    await db.insert(assets).values({
+      id: assetId,
+      companyId: seed.companyId,
+      provider: "local",
+      objectKey: `retention/${assetId}`,
+      contentType: "text/plain",
+      byteSize: 5,
+      sha256: "0".repeat(64),
+      createdByUserId: seed.userId,
+    });
+    await db.insert(issueAttachments).values({
+      companyId: seed.companyId,
+      issueId,
+      assetId,
+    });
+
+    const failing = await request(
+      appFor(boardActor(seed), {
+        deleteObject: async () => {
+          throw new Error("storage unavailable");
+        },
+      }),
+    )
+      .post(`/api/companies/${seed.companyId}/issues/retention-purge`)
+      .send({})
+      .expect(200);
+    expect(failing.body.deleted).toEqual([]);
+    expect(failing.body.skipped).toEqual([
+      expect.objectContaining({
+        id: issueId,
+        reason: "attachment_cleanup_failed",
+        details: expect.objectContaining({
+          attachmentId: expect.any(String),
+          objectKey: `retention/${assetId}`,
+        }),
+      }),
+    ]);
+    expect(
+      (await db.select({ id: issues.id }).from(issues)).map((row) => row.id),
+    ).toContain(issueId);
+    expect(
+      (await db.select().from(activityLog)).filter(
+        (row) => row.action === "issue.retention_deleted",
+      ),
+    ).toHaveLength(0);
+
+    const retry = await request(
+      appFor(boardActor(seed), { deleteObject: async () => {} }),
+    )
+      .post(`/api/companies/${seed.companyId}/issues/retention-purge`)
+      .send({})
+      .expect(200);
+    expect(retry.body.deleted.map((row: { id: string }) => row.id)).toEqual([issueId]);
+    expect(
+      (await db.select({ id: issues.id }).from(issues)).map((row) => row.id),
+    ).not.toContain(issueId);
   });
 });

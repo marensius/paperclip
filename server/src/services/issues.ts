@@ -210,6 +210,7 @@ import {
   type IssueLivenessFinding,
 } from "./recovery/issue-graph-liveness.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
+import { retentionEligibilityCondition } from "./issue-retention.js";
 import { finalizeStatusCardsForStalledGeneration } from "./status-card-finalization.js";
 import { finalizeSummarySlotsForTerminalIssue } from "./summary-slot-finalization.js";
 import {
@@ -11683,30 +11684,46 @@ export function issueService(db: Db) {
       return cleared;
     },
 
-    remove: (id: string, options: { requireRetentionEligible?: boolean } = {}) =>
+    remove: (
+      id: string,
+      options: {
+        requireRetentionEligible?: {
+          companyId: string;
+          cutoff: Date;
+          audit: {
+            actorType: "agent" | "user";
+            actorId: string;
+            agentId: string | null;
+            runId: string | null;
+            agentApiKeyId: string | null;
+            retentionDays: number;
+            identifier: string | null;
+            status: string;
+            terminalAt: string;
+            archivedAt: string;
+            cutoff: string;
+          };
+        };
+        cleanupAttachments?: () => Promise<void>;
+      } = {},
+    ) =>
       db.transaction(async (tx) => {
         if (options.requireRetentionEligible) {
-          // Serialize against a concurrent reopen or checkout and re-check the
-          // terminal state inside the delete transaction. The route's
-          // eligibility query is the primary gate; this closes the race between
-          // selection and deletion.
+          const { companyId, cutoff } = options.requireRetentionEligible;
+          // Re-evaluate the complete eligibility predicate under a row lock.
+          // Locking only on id and then checking a few columns would let a
+          // reopened/re-completed issue pass with a fresh terminal timestamp.
           const [guard] = await tx
-            .select({
-              status: issues.status,
-              checkoutRunId: issues.checkoutRunId,
-              executionRunId: issues.executionRunId,
-              monitorNextCheckAt: issues.monitorNextCheckAt,
-            })
+            .select({ id: issues.id })
             .from(issues)
-            .where(eq(issues.id, id))
+            .where(and(eq(issues.id, id), retentionEligibilityCondition(companyId, cutoff)))
             .for("update");
-          if (!guard) return null;
-          if (
-            (guard.status !== "done" && guard.status !== "cancelled") ||
-            guard.checkoutRunId ||
-            guard.executionRunId ||
-            guard.monitorNextCheckAt
-          ) {
+          if (!guard) {
+            const [existing] = await tx
+              .select({ id: issues.id })
+              .from(issues)
+              .where(eq(issues.id, id));
+            if (!existing) return null;
             throw conflict("Issue is no longer retention-eligible.");
           }
         }
@@ -11760,6 +11777,38 @@ export function issueService(db: Db) {
         }
 
         if (!removedIssue) return null;
+
+        if (options.cleanupAttachments) {
+          // Run inside the transaction so a storage failure rolls the delete
+          // back and leaves the issue retryable on the next purge pass.
+          await options.cleanupAttachments();
+        }
+
+        if (options.requireRetentionEligible) {
+          const retention = options.requireRetentionEligible;
+          const audit = retention.audit;
+          await logActivity(tx as unknown as Db, {
+            companyId: retention.companyId,
+            actorType: audit.actorType,
+            actorId: audit.actorId,
+            agentId: audit.agentId,
+            runId: audit.runId,
+            agentApiKeyId: audit.agentApiKeyId,
+            action: "issue.retention_deleted",
+            entityType: "issue",
+            entityId: id,
+            details: {
+              identifier: audit.identifier,
+              status: audit.status,
+              terminalAt: audit.terminalAt,
+              archivedAt: audit.archivedAt,
+              retentionDays: audit.retentionDays,
+              cutoff: audit.cutoff,
+              policy: "issue-retention.v1",
+            },
+          });
+        }
+
         const [enriched] = await withIssueLabels(tx, [removedIssue]);
         return enriched;
       }),
