@@ -49,8 +49,11 @@ import {
   resolveGlobalMaxConcurrentRuns,
 } from "./global-run-admission.js";
 import {
+  admitHostQueuedRun,
   admitHostRunSlot,
+  readRunAdmissionHostKey,
   resolveMaxConcurrentRunsPerHost,
+  resolveMaxQueuedRunsPerHost,
   resolveRunAdmissionHostKey,
   withRunAdmissionHostKey,
 } from "./host-run-admission.js";
@@ -196,7 +199,7 @@ export interface HeartbeatQueueDependencies extends Pick<HeartbeatRetryDependenc
     "resolveSessionBeforeForWakeup" | "hasResolvablePriorSessionWorkspaceForWake">,
   Pick<HeartbeatRecoveryDependencies, "setRunStatus"> {
   sweepPendingCleanupLeases: ReturnType<typeof createHeartbeatRecovery>["sweepPendingCleanupLeases"];
-  options: Pick<HeartbeatServiceOptions, "beforeChatControlRecoveryCheck" | "globalMaxConcurrentRuns" | "maxConcurrentRunsPerHost">;
+  options: Pick<HeartbeatServiceOptions, "beforeChatControlRecoveryCheck" | "globalMaxConcurrentRuns" | "maxConcurrentRunsPerHost" | "maxQueuedRunsPerHost">;
   issuesSvc: Pick<ReturnType<typeof issueService>, "getDependencyReadiness" | "listDependencyReadiness">;
   treeControlSvc: Pick<ReturnType<typeof issueTreeControlService>, "getActivePauseHoldGate">;
   budgets: Pick<ReturnType<typeof budgetService>, "getInvocationBlock">;
@@ -232,6 +235,234 @@ const HEARTBEAT_MAX_CONCURRENT_RUNS_MIN = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 50;
 
 export const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
+
+/**
+ * Wake reason for wakes parked by the per-host queued-run depth cap
+ * (`PAPERCLIP_MAX_QUEUED_RUNS_PER_HOST`). These wakes carry a serializable
+ * `runSeed` instead of a `heartbeat_runs` row and are promoted when a host
+ * slot frees. Never `failed`/`cancelled` because the queue is full.
+ */
+export const HOST_QUEUE_DEPTH_WAKE_REASON = "host_queue_depth";
+
+const HOST_QUEUE_DEPTH_PROMOTION_BATCH = 50;
+
+const HOST_QUEUE_DEPTH_PROMOTION_BACKOFF_MS = 15_000;
+
+type HostQueueDepthRunSeedInsert = typeof heartbeatRuns.$inferInsert;
+
+/**
+ * Rebuilds the exact `heartbeat_runs` insert a parked `host_queue_depth` wake
+ * would have produced, or reports the seed as malformed so promotion can fail
+ * the wake once instead of retrying forever. Only server-written seed fields
+ * are accepted; `id` is kept when the ordinary enqueue path preallocated one
+ * (explicit continuations bind their successor id), while `status`, identity,
+ * and timestamps are always owned by promotion.
+ */
+function readHostQueueDepthRunSeed(
+  payloadValue: unknown,
+  wake: { id: string; companyId: string; agentId: string },
+):
+  | { ok: true; values: HostQueueDepthRunSeedInsert }
+  | { ok: false; error: string } {
+  const seedRaw = parseObject(payloadValue).runSeed;
+  if (
+    typeof seedRaw !== "object" ||
+    seedRaw === null ||
+    Array.isArray(seedRaw)
+  ) {
+    return {
+      ok: false,
+      error: "Host queue depth wake carries no serializable runSeed",
+    };
+  }
+  const seed = seedRaw as Record<string, unknown>;
+  if (seed.companyId !== wake.companyId || seed.agentId !== wake.agentId) {
+    return {
+      ok: false,
+      error: "Host queue depth runSeed identity does not match its wake",
+    };
+  }
+  if (
+    typeof seed.invocationSource !== "string" ||
+    seed.invocationSource.length === 0
+  ) {
+    return {
+      ok: false,
+      error: "Host queue depth runSeed is missing its invocationSource",
+    };
+  }
+  const contextSnapshot = seed.contextSnapshot;
+  if (
+    typeof contextSnapshot !== "object" ||
+    contextSnapshot === null ||
+    Array.isArray(contextSnapshot)
+  ) {
+    return {
+      ok: false,
+      error: "Host queue depth runSeed is missing its contextSnapshot",
+    };
+  }
+  const seedId =
+    typeof seed.id === "string" && isUuidLike(seed.id) ? seed.id : null;
+  if (seed.id !== undefined && seed.id !== null && seedId === null) {
+    return {
+      ok: false,
+      error: "Host queue depth runSeed carries an invalid run id",
+    };
+  }
+  const issueId =
+    typeof seed.issueId === "string" && isUuidLike(seed.issueId)
+      ? seed.issueId
+      : null;
+  if (seed.issueId !== undefined && seed.issueId !== null && issueId === null) {
+    return {
+      ok: false,
+      error: "Host queue depth runSeed carries an invalid issue id",
+    };
+  }
+  const values: HostQueueDepthRunSeedInsert = {
+    ...(seedId ? { id: seedId } : {}),
+    companyId: wake.companyId,
+    agentId: wake.agentId,
+    scopeKind: seed.scopeKind === "issue" ? "issue" : "company",
+    issueId,
+    invocationSource: seed.invocationSource,
+    triggerDetail:
+      typeof seed.triggerDetail === "string" ? seed.triggerDetail : null,
+    status: "queued",
+    responsibleUserId:
+      typeof seed.responsibleUserId === "string"
+        ? seed.responsibleUserId
+        : null,
+    wakeupRequestId: wake.id,
+    contextSnapshot: contextSnapshot as Record<string, unknown>,
+  };
+  if (typeof seed.retryOfRunId === "string" && isUuidLike(seed.retryOfRunId)) {
+    values.retryOfRunId = seed.retryOfRunId;
+  }
+  if (seed.sessionIdBefore === null || typeof seed.sessionIdBefore === "string") {
+    values.sessionIdBefore = seed.sessionIdBefore;
+  }
+  if (typeof seed.continuationAttempt === "number") {
+    values.continuationAttempt = Math.max(0, Math.floor(seed.continuationAttempt));
+  }
+  if (typeof seed.scheduledRetryAttempt === "number") {
+    values.scheduledRetryAttempt = Math.max(
+      0,
+      Math.floor(seed.scheduledRetryAttempt),
+    );
+  }
+  if (
+    seed.scheduledRetryReason === null ||
+    typeof seed.scheduledRetryReason === "string"
+  ) {
+    values.scheduledRetryReason = seed.scheduledRetryReason;
+  }
+  return { ok: true, values };
+}
+
+/**
+ * Parks an ordinary enqueue behind the per-host queued-run depth cap. The wake
+ * keeps a serializable `runSeed` instead of a `heartbeat_runs` row; repeated
+ * wakes for the same agent+issue coalesce into the existing parked wake.
+ * Returns the `deferred` queue outcome so the enqueue transaction stops
+ * exactly where a queued run insert would have happened.
+ */
+async function deferHostQueueDepthWake(
+  tx: Db,
+  input: {
+    companyId: string;
+    agentId: string;
+    source: string;
+    triggerDetail: string | null;
+    requestedByActorType: string | null;
+    requestedByActorId: string | null;
+    idempotencyKey: string | null;
+    issueId: string | null;
+    payload: Record<string, unknown> | null;
+    contextSnapshot: Record<string, unknown>;
+    hostKey: string | null;
+    runSeed: Record<string, unknown>;
+  },
+): Promise<{ kind: "deferred" }> {
+  const buildDeferredPayload = (
+    contextSnapshot: Record<string, unknown>,
+    runSeed: Record<string, unknown>,
+  ) => ({
+    ...(input.payload ?? {}),
+    issueId: input.issueId,
+    [DEFERRED_WAKE_CONTEXT_KEY]: contextSnapshot,
+    hostQueueDepth: { hostKey: input.hostKey },
+    runSeed,
+  });
+  const [existing] = await tx
+    .select()
+    .from(agentWakeupRequests)
+    .where(
+      and(
+        eq(agentWakeupRequests.companyId, input.companyId),
+        eq(agentWakeupRequests.agentId, input.agentId),
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        eq(agentWakeupRequests.reason, HOST_QUEUE_DEPTH_WAKE_REASON),
+        input.issueId
+          ? sql`${agentWakeupRequests.payload}->>'issueId' = ${input.issueId}`
+          : sql`${agentWakeupRequests.payload}->>'issueId' is null`,
+      ),
+    )
+    .orderBy(asc(agentWakeupRequests.requestedAt), asc(agentWakeupRequests.id))
+    .limit(1);
+  const now = new Date();
+  if (existing) {
+    // Coalesce repeated wakes for the same agent+issue into the parked wake
+    // instead of stacking a second deferred receipt. Merging the contexts
+    // keeps queued comment ids and continuation markers from both wakes.
+    const seed = readHostQueueDepthRunSeed(existing.payload, existing);
+    const existingContext = parseObject(
+      seed.ok
+        ? seed.values.contextSnapshot
+        : parseObject(existing.payload)[DEFERRED_WAKE_CONTEXT_KEY],
+    );
+    const merged = mergeCoalescedContextSnapshot(
+      existingContext,
+      input.contextSnapshot,
+      { preserveExistingInteractionContinuation: true },
+    );
+    const mergedContext = input.hostKey
+      ? withRunAdmissionHostKey(merged, input.hostKey)
+      : merged;
+    await tx
+      .update(agentWakeupRequests)
+      .set({
+        payload: buildDeferredPayload(mergedContext, {
+          ...input.runSeed,
+          contextSnapshot: mergedContext,
+        }),
+        coalescedCount: existing.coalescedCount + 1,
+        updatedAt: now,
+      })
+      .where(
+        and(
+          eq(agentWakeupRequests.id, existing.id),
+          eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          eq(agentWakeupRequests.reason, HOST_QUEUE_DEPTH_WAKE_REASON),
+        ),
+      );
+    return { kind: "deferred" };
+  }
+  await tx.insert(agentWakeupRequests).values({
+    companyId: input.companyId,
+    agentId: input.agentId,
+    source: input.source,
+    triggerDetail: input.triggerDetail,
+    reason: HOST_QUEUE_DEPTH_WAKE_REASON,
+    payload: buildDeferredPayload(input.contextSnapshot, input.runSeed),
+    status: "deferred_issue_execution",
+    requestedByActorType: input.requestedByActorType,
+    requestedByActorId: input.requestedByActorId,
+    idempotencyKey: input.idempotencyKey,
+  });
+  return { kind: "deferred" };
+}
 
 export const EXECUTION_PATH_HEARTBEAT_RUN_STATUSES = [
   "queued",
@@ -411,6 +642,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
   );
   const maxConcurrentRunsPerHost = resolveMaxConcurrentRunsPerHost(
     options.maxConcurrentRunsPerHost,
+  );
+  const maxQueuedRunsPerHost = resolveMaxQueuedRunsPerHost(
+    options.maxQueuedRunsPerHost,
   );
 
   function parseHeartbeatPolicy(agent: typeof agents.$inferSelect) {
@@ -1913,6 +2147,112 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     return globalMaxConcurrentRuns > 0;
   }
 
+  /**
+   * Promotes wakes parked by the per-host queued-run depth cap once host
+   * budget frees. Promotion re-checks admission under the host advisory lock
+   * and reproduces the exact run the ordinary enqueue path would have
+   * created. A still-full host just bumps the wake's backoff; a malformed
+   * runSeed fails the wake once instead of retrying forever.
+   */
+  async function resumeHostQueueDepthWakes() {
+    const cutoff = await getWorktreeExecutionCutoff();
+    const candidates = await db
+      .select({ wake: agentWakeupRequests })
+      .from(agentWakeupRequests)
+      .innerJoin(companies, eq(companies.id, agentWakeupRequests.companyId))
+      .where(and(
+        eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        eq(agentWakeupRequests.reason, HOST_QUEUE_DEPTH_WAKE_REASON),
+        eq(companies.status, "active"),
+        lte(agentWakeupRequests.updatedAt, new Date(Date.now() - HOST_QUEUE_DEPTH_PROMOTION_BACKOFF_MS)),
+        cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined,
+      ))
+      .orderBy(asc(agentWakeupRequests.updatedAt))
+      .limit(HOST_QUEUE_DEPTH_PROMOTION_BATCH);
+    for (const { wake } of candidates) {
+      let promoted: HeartbeatRun | null = null;
+      try {
+        promoted = await db.transaction(async (tx) => {
+          const lockedWake = await tx
+            .select()
+            .from(agentWakeupRequests)
+            .where(and(
+              eq(agentWakeupRequests.id, wake.id),
+              eq(agentWakeupRequests.companyId, wake.companyId),
+            ))
+            .for("update")
+            .limit(1)
+            .then((rows) => rows[0] ?? null);
+          if (!lockedWake || lockedWake.status !== "deferred_issue_execution" ||
+              lockedWake.reason !== HOST_QUEUE_DEPTH_WAKE_REASON) return null;
+          const seed = readHostQueueDepthRunSeed(lockedWake.payload, lockedWake);
+          if (!seed.ok) {
+            const now = new Date();
+            logger.warn(
+              { queueId: lockedWake.id, companyId: lockedWake.companyId, agentId: lockedWake.agentId },
+              seed.error,
+            );
+            await tx.update(agentWakeupRequests).set({
+              status: "failed",
+              error: seed.error,
+              finishedAt: now,
+              updatedAt: now,
+            }).where(eq(agentWakeupRequests.id, lockedWake.id));
+            return null;
+          }
+          const hostKey = readRunAdmissionHostKey(seed.values.contextSnapshot);
+          const admitted = await admitHostQueuedRun(tx as unknown as Db, {
+            maxRunning: maxConcurrentRunsPerHost,
+            maxQueued: maxQueuedRunsPerHost,
+            hostKey,
+          });
+          if (!admitted) {
+            // The host is still full (or the advisory lock is busy). Keep the
+            // wake parked and back off until the next promotion pass.
+            await tx.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
+              eq(agentWakeupRequests.id, lockedWake.id),
+              eq(agentWakeupRequests.status, "deferred_issue_execution"),
+            ));
+            return null;
+          }
+          const now = new Date();
+          const [run] = await tx
+            .insert(heartbeatRuns)
+            .values(seed.values)
+            .returning();
+          await tx.update(agentWakeupRequests).set({
+            status: "queued",
+            runId: run.id,
+            updatedAt: now,
+          }).where(and(
+            eq(agentWakeupRequests.id, lockedWake.id),
+            eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          ));
+          return run;
+        });
+      } catch (err) {
+        logger.error(
+          { err, queueId: wake.id },
+          "failed to promote host queue depth wake",
+        );
+        continue;
+      }
+      if (!promoted) continue;
+      publishLiveEvent({
+        companyId: promoted.companyId,
+        type: "heartbeat.run.queued",
+        payload: {
+          runId: promoted.id,
+          agentId: promoted.agentId,
+          invocationSource: promoted.invocationSource,
+          triggerDetail: promoted.triggerDetail,
+          wakeupRequestId: promoted.wakeupRequestId,
+        },
+      });
+      await startNextQueuedRunForAgent(promoted.agentId);
+    }
+  }
+
   async function resumeQueuedRuns() {
     if ((await getSchedulingSuppression()).suppressed) return;
     await resumeExecutionWaitComments();
@@ -1944,6 +2284,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           sql`${agentWakeupRequests.payload} #>> '{_paperclipWakeContext,wakeReason}' = 'issue_comment_mentioned'`)))
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+        // Host-queue-depth wakes are owned by resumeHostQueueDepthWakes and
+        // must not be consumed by the saved-comment recovery passes.
+        sql`coalesce(${agentWakeupRequests.reason}, '') <> ${HOST_QUEUE_DEPTH_WAKE_REASON}`,
         isNull(issues.executionRunId),
         or(and(
           sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
@@ -2012,6 +2355,11 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     for (const agentId of await listQueuedAgentIdsByPriority(cutoff)) {
       await startNextQueuedRunForAgent(agentId);
     }
+
+    // Promote host-queue-depth wakes after the claims above have moved queued
+    // runs into running slots, so the freed queued budget is visible to the
+    // per-host admission recount.
+    await resumeHostQueueDepthWakes();
   }
 
   // A 403 from claimQueuedRun comes from the run's own persisted identity
@@ -4265,6 +4613,90 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
             enrichedContextSnapshot.explicitUserContinuation = explicitContinuation;
           }
 
+          // Persist the admission host key at enqueue (not only at claim) so
+          // the per-host queued-run depth cap can count this run before it
+          // starts. Receipt-bound wakes (durable chat/dot/muse/case, task
+          // retries, saved-comment queues) keep their own coalescing and stay
+          // out of the queue-depth gate.
+          const enqueueIssueContext = issueId
+            ? await getIssueExecutionContext(agent.companyId, issueId)
+            : null;
+          const enqueueEnvironmentId =
+            parseIssueExecutionWorkspaceSettings(
+              enqueueIssueContext?.executionWorkspaceSettings,
+              { includeEnvironmentId: true },
+            )?.environmentId ??
+            agent.defaultEnvironmentId ??
+            null;
+          const enqueueHostKey = await resolveRunAdmissionHostKey(
+            tx as unknown as Db,
+            { environmentId: enqueueEnvironmentId },
+          );
+          const receiptBoundWake = Boolean(
+            receiptRequest ||
+              opts.taskRetryRequestId ||
+              executionWaitRequestId ||
+              opts.queuedCommentInterruptId ||
+              opts.queuedCommentRequestId,
+          );
+          const hostQueuedRunAdmitted =
+            receiptBoundWake ||
+            (await admitHostQueuedRun(tx as unknown as Db, {
+              maxRunning: maxConcurrentRunsPerHost,
+              maxQueued: maxQueuedRunsPerHost,
+              hostKey: enqueueHostKey,
+            }));
+          if (!hostQueuedRunAdmitted) {
+            const runContextSnapshot = enqueueHostKey
+              ? withRunAdmissionHostKey(
+                  enrichedContextSnapshot,
+                  enqueueHostKey,
+                )
+              : enrichedContextSnapshot;
+            return deferHostQueueDepthWake(tx as unknown as Db, {
+              companyId: agent.companyId,
+              agentId,
+              source,
+              triggerDetail,
+              requestedByActorType: opts.requestedByActorType ?? null,
+              requestedByActorId: opts.requestedByActorId ?? null,
+              idempotencyKey: opts.idempotencyKey ?? null,
+              issueId: issue.id,
+              payload,
+              contextSnapshot: runContextSnapshot,
+              hostKey: enqueueHostKey,
+              runSeed: {
+                ...(explicitContinuation
+                  ? { id: explicitContinuationRunId }
+                  : {}),
+                companyId: agent.companyId,
+                agentId,
+                scopeKind: readNonEmptyString(enrichedContextSnapshot.issueId)
+                  ? "issue"
+                  : "company",
+                issueId: readNonEmptyString(enrichedContextSnapshot.issueId),
+                invocationSource: source,
+                triggerDetail,
+                responsibleUserId: await resolveQueuedResponsibleUserId(),
+                retryOfRunId: failedChatRetry
+                  ? durableRequest!.failedRunRetry!.failedRunId
+                  : opts.failedRunId ?? automaticParentRunId,
+                contextSnapshot: runContextSnapshot,
+                sessionIdBefore: explicitContinuation ? null : sessionBefore,
+                continuationAttempt,
+                ...(reconciledSourceRunId
+                  ? { retryOfRunId: reconciledSourceRunId }
+                  : {}),
+                ...(reconciledRestoreRetryCount !== null
+                  ? {
+                      scheduledRetryAttempt: reconciledRestoreRetryCount,
+                      scheduledRetryReason: "transient_failure",
+                    }
+                  : {}),
+              },
+            });
+          }
+
           const wakeupRequest = await tx
             .insert(agentWakeupRequests)
             .values({
@@ -4319,6 +4751,10 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
                   .orderBy(asc(agentWakeupRequests.requestedAt))
               : [];
           const adoptedComments = pendingComments.filter((wake) => {
+            // A parked host-queue wake carries a complete runSeed, not just
+            // comment ids. It must be promoted as a whole instead of having
+            // its comments absorbed (and its seed dropped) by another run.
+            if (wake.reason === HOST_QUEUE_DEPTH_WAKE_REASON) return false;
             if (wake.id === executionWaitRequestId) return true;
             if (wake.id === opts.queuedCommentInterruptId || wake.id === opts.queuedCommentRequestId) return true;
             const deferredPayload = parseObject(wake.payload);
@@ -4365,13 +4801,24 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
               retryOfRunId: failedChatRetry
                 ? durableRequest!.failedRunRetry!.failedRunId
                 : opts.failedRunId ?? automaticParentRunId,
-              contextSnapshot: adoptedComments.length
-                ? withQueuedCommentIdsInRunContext(
-                    enrichedContextSnapshot,
-                    adoptedCommentIds,
-                    adoptedComments.map((wake) => wake.id),
+              contextSnapshot: enqueueHostKey
+                ? withRunAdmissionHostKey(
+                    adoptedComments.length
+                      ? withQueuedCommentIdsInRunContext(
+                          enrichedContextSnapshot,
+                          adoptedCommentIds,
+                          adoptedComments.map((wake) => wake.id),
+                        )
+                      : enrichedContextSnapshot,
+                    enqueueHostKey,
                   )
-                : enrichedContextSnapshot,
+                : adoptedComments.length
+                  ? withQueuedCommentIdsInRunContext(
+                      enrichedContextSnapshot,
+                      adoptedCommentIds,
+                      adoptedComments.map((wake) => wake.id),
+                    )
+                  : enrichedContextSnapshot,
               sessionIdBefore: explicitContinuation ? null : sessionBefore,
               continuationAttempt,
               ...(reconciledSourceRunId
@@ -4625,6 +5072,53 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
         return { kind: "skipped" as const };
       }
 
+      // Same host-key persistence and queued-depth gate as the issue path.
+      const enqueueEnvironmentId = agent.defaultEnvironmentId ?? null;
+      const enqueueHostKey = await resolveRunAdmissionHostKey(
+        tx as unknown as Db,
+        { environmentId: enqueueEnvironmentId },
+      );
+      const hostQueuedRunAdmitted = await admitHostQueuedRun(
+        tx as unknown as Db,
+        {
+          maxRunning: maxConcurrentRunsPerHost,
+          maxQueued: maxQueuedRunsPerHost,
+          hostKey: enqueueHostKey,
+        },
+      );
+      if (!hostQueuedRunAdmitted) {
+        const runContextSnapshot = enqueueHostKey
+          ? withRunAdmissionHostKey(enrichedContextSnapshot, enqueueHostKey)
+          : enrichedContextSnapshot;
+        return deferHostQueueDepthWake(tx as unknown as Db, {
+          companyId: agent.companyId,
+          agentId,
+          source,
+          triggerDetail,
+          requestedByActorType: opts.requestedByActorType ?? null,
+          requestedByActorId: opts.requestedByActorId ?? null,
+          idempotencyKey: opts.idempotencyKey ?? null,
+          issueId: readNonEmptyString(enrichedContextSnapshot.issueId),
+          payload,
+          contextSnapshot: runContextSnapshot,
+          hostKey: enqueueHostKey,
+          runSeed: {
+            companyId: agent.companyId,
+            agentId,
+            scopeKind: readNonEmptyString(enrichedContextSnapshot.issueId)
+              ? "issue"
+              : "company",
+            issueId: readNonEmptyString(enrichedContextSnapshot.issueId),
+            invocationSource: source,
+            triggerDetail,
+            responsibleUserId: await resolveQueuedResponsibleUserId(),
+            contextSnapshot: runContextSnapshot,
+            sessionIdBefore: sessionBefore,
+            continuationAttempt,
+          },
+        });
+      }
+
       const wakeupRequest = await tx
         .insert(agentWakeupRequests)
         .values({
@@ -4655,7 +5149,9 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
           status: "queued",
           responsibleUserId: await resolveQueuedResponsibleUserId(),
           wakeupRequestId: wakeupRequest.id,
-          contextSnapshot: enrichedContextSnapshot,
+          contextSnapshot: enqueueHostKey
+            ? withRunAdmissionHostKey(enrichedContextSnapshot, enqueueHostKey)
+            : enrichedContextSnapshot,
           sessionIdBefore: sessionBefore,
           continuationAttempt,
         })
@@ -4673,7 +5169,8 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
       return { kind: "queued" as const, run: newRun };
     });
 
-    if (queueOutcome.kind === "skipped") return null;
+    if (queueOutcome.kind === "skipped" || queueOutcome.kind === "deferred")
+      return null;
     const newRun = queueOutcome.run;
 
     publishLiveEvent({
@@ -5004,6 +5501,7 @@ export function createHeartbeatQueue(db: Db, dependencies: HeartbeatQueueDepende
     withChatControlRecoveryGate,
     trackWakeup,
     resumeQueuedRuns,
+    resumeHostQueueDepthWakes,
     resumeNextGlobalRun,
     hasGlobalRunLimit,
     parseHeartbeatPolicy,
